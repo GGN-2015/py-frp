@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 from .config import ClientConfig, ProxyConfig
@@ -12,9 +13,18 @@ from .protocol import ProtocolError, close_writer, pipe_streams, read_message, w
 LOGGER = logging.getLogger(__name__)
 
 
+class FatalClientError(RuntimeError):
+    """Raised when the server says reconnecting would repeat the same failure."""
+
+
 class Client:
-    def __init__(self, config: ClientConfig):
+    def __init__(
+        self,
+        config: ClientConfig,
+        on_registered: Callable[[dict[str, Any]], None] | None = None,
+    ):
         self.config = config
+        self.on_registered = on_registered
         self._proxies = {proxy.name: proxy for proxy in config.proxies}
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -25,6 +35,10 @@ class Client:
             except asyncio.CancelledError:
                 await self._cancel_tunnel_tasks()
                 raise
+            except FatalClientError as exc:
+                LOGGER.error("%s", exc)
+                await self._cancel_tunnel_tasks()
+                return
             except Exception as exc:
                 LOGGER.warning(
                     "client connection failed: %s; reconnecting in %.1fs",
@@ -40,16 +54,20 @@ class Client:
         try:
             await write_message(writer, {"type": "hello", "version": 1, "client": "py-frp"})
             hello = await read_message(reader)
-            if hello is None or hello.get("type") == "error":
-                raise ProtocolError(_message_error(hello, "server closed during hello"))
+            if hello is None:
+                raise ProtocolError("server closed during hello")
+            _raise_error_response(hello)
 
             await write_message(writer, {"type": "register", "services": self._service_payloads()})
             registered = await read_message(reader)
-            if registered is None or registered.get("type") == "error":
-                raise ProtocolError(_message_error(registered, "server closed during register"))
+            if registered is None:
+                raise ProtocolError("server closed during register")
+            _raise_error_response(registered)
             if registered.get("type") != "registered" or registered.get("status") != "ok":
                 raise ProtocolError(f"unexpected register response: {registered!r}")
             LOGGER.info("registered %d service(s)", len(self.config.proxies))
+            if self.on_registered is not None:
+                self.on_registered(registered)
             heartbeat_task = asyncio.create_task(self._heartbeat(writer))
 
             while True:
@@ -62,7 +80,7 @@ class Client:
                 elif message.get("type") == "pong":
                     LOGGER.debug("received pong")
                 elif message.get("type") == "error":
-                    raise ProtocolError(_message_error(message, "server error"))
+                    _raise_error_response(message)
                 else:
                     LOGGER.debug("ignored control message: %s", message)
         finally:
@@ -190,3 +208,12 @@ def _message_error(message: dict[str, Any] | None, default: str) -> str:
     if isinstance(message, dict) and message.get("error"):
         return str(message["error"])
     return default
+
+
+def _raise_error_response(message: dict[str, Any]) -> None:
+    if message.get("type") != "error":
+        return
+    error = _message_error(message, "server error")
+    if message.get("fatal") is True:
+        raise FatalClientError(error)
+    raise ProtocolError(error)

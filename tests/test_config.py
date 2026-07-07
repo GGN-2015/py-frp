@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from py_frp.config import ConfigError, load_client_config, load_server_config
+from py_frp.pool import TOKEN_ALPHABET, generate_tokens, parse_port_pool
 
 
 class ConfigTests(unittest.TestCase):
@@ -186,6 +187,19 @@ class ConfigTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ConfigError, "not an integer"):
                 load_client_config(path)
+
+    def test_parse_port_pool_ranges_and_deduplicates(self) -> None:
+        self.assertEqual(parse_port_pool("6000-6002,6002,7000"), (6000, 6001, 6002, 7000))
+
+    def test_generated_tokens_use_unambiguous_alphabet(self) -> None:
+        tokens = generate_tokens(8, length=32)
+
+        self.assertEqual(len(tokens), 8)
+        self.assertEqual(len(set(tokens)), 8)
+        for token in tokens:
+            self.assertEqual(len(token), 32)
+            self.assertTrue(set(token) <= set(TOKEN_ALPHABET))
+            self.assertFalse(set(token) & {"I", "O", "0", "1", "l"})
 
 
 if __name__ == "__main__":

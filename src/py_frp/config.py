@@ -34,6 +34,9 @@ class ServerConfig:
     allow_dynamic: bool = True
     source_flavor: str = "py-frp"
     open_timeout: float = 15.0
+    port_pool: tuple[int, ...] = ()
+    pool_tokens: tuple[str, ...] = ()
+    pool_bind_host: str = "0.0.0.0"
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ def load_client_config(path: str | Path) -> ClientConfig:
 def privileged_listen_ports(config: ServerConfig) -> tuple[int, ...]:
     ports = [config.bind_port]
     ports.extend(service.bind_port for service in config.services)
+    ports.extend(config.port_pool)
     return tuple(port for port in ports if 0 < port < 1024)
 
 
@@ -90,7 +94,8 @@ def describe_server_config(config: ServerConfig) -> str:
     dynamic = "dynamic" if config.allow_dynamic else "preconfigured"
     return (
         f"{config.bind_host}:{config.bind_port} "
-        f"({config.source_flavor}, {dynamic}, services={len(config.services)})"
+        f"({config.source_flavor}, {dynamic}, services={len(config.services)}, "
+        f"pool_ports={len(config.port_pool)})"
     )
 
 

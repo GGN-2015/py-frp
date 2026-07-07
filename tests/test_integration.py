@@ -6,6 +6,7 @@ import unittest
 
 from py_frp.client import Client
 from py_frp.config import ClientConfig, ProxyConfig, ServerConfig, ServerServiceConfig
+from py_frp.pool import token_service_name
 from py_frp.protocol import close_writer, read_message, write_message
 from py_frp.server import Server
 
@@ -337,6 +338,176 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await close_writer(good_tunnel_writer)
             await tunnel_server.close()
 
+    async def test_token_pool_assigns_remote_port_and_tunnels(self) -> None:
+        async def echo(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            data = await reader.read(1024)
+            writer.write(b"pool:" + data)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        token = "pool-secret"
+        service_name = token_service_name(token)
+        echo_server = await asyncio.start_server(echo, "127.0.0.1", 0)
+        echo_port = int(echo_server.sockets[0].getsockname()[1])
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                allow_dynamic=False,
+                port_pool=(0,),
+                pool_tokens=(token,),
+                pool_bind_host="127.0.0.1",
+            )
+        )
+        await tunnel_server.start()
+        control_port = tunnel_server.control_addresses()[0][1]
+        assigned: list[int] = []
+        client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=control_port,
+                token=token,
+                reconnect_delay=0.1,
+                proxies=(
+                    ProxyConfig(
+                        name=service_name,
+                        local_host="127.0.0.1",
+                        local_port=echo_port,
+                        token=token,
+                    ),
+                ),
+            ),
+            on_registered=lambda message: assigned.extend(
+                int(service["bind_port"])
+                for service in message["services"]
+                if isinstance(service, dict)
+            ),
+        )
+        client_task = asyncio.create_task(client.run())
+        try:
+            public_addr = await _wait_for_service(tunnel_server, service_name)
+            self.assertEqual(assigned, [public_addr[1]])
+            online = await tunnel_server.online_pool_clients()
+            self.assertEqual(online[token], public_addr)
+            reader, writer = await asyncio.open_connection(*public_addr)
+            writer.write(b"hello")
+            await writer.drain()
+            self.assertEqual(await reader.read(10), b"pool:hello")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            client_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await client_task
+            await tunnel_server.close()
+            echo_server.close()
+            await echo_server.wait_closed()
+
+    async def test_duplicate_token_login_kicks_previous_client(self) -> None:
+        async def echo_first(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await reader.read(1024)
+            writer.write(b"first")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def echo_second(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await reader.read(1024)
+            writer.write(b"second")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        token = "shared-secret"
+        service_name = token_service_name(token)
+        first_local = await asyncio.start_server(echo_first, "127.0.0.1", 0)
+        second_local = await asyncio.start_server(echo_second, "127.0.0.1", 0)
+        first_port = int(first_local.sockets[0].getsockname()[1])
+        second_port = int(second_local.sockets[0].getsockname()[1])
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                allow_dynamic=False,
+                port_pool=(0,),
+                pool_tokens=(token,),
+                pool_bind_host="127.0.0.1",
+            )
+        )
+        await tunnel_server.start()
+        control_port = tunnel_server.control_addresses()[0][1]
+
+        first_client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=control_port,
+                token=token,
+                reconnect_delay=0.1,
+                proxies=(
+                    ProxyConfig(
+                        name=service_name,
+                        local_host="127.0.0.1",
+                        local_port=first_port,
+                        token=token,
+                    ),
+                ),
+            )
+        )
+        second_client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=control_port,
+                token=token,
+                reconnect_delay=0.1,
+                proxies=(
+                    ProxyConfig(
+                        name=service_name,
+                        local_host="127.0.0.1",
+                        local_port=second_port,
+                        token=token,
+                    ),
+                ),
+            )
+        )
+        first_task = asyncio.create_task(first_client.run())
+        second_task: asyncio.Task[None] | None = None
+        try:
+            first_addr = await _wait_for_service(tunnel_server, service_name)
+            self.assertEqual((await tunnel_server.online_pool_clients())[token], first_addr)
+
+            second_task = asyncio.create_task(second_client.run())
+            await _wait_for_task_done(first_task)
+            second_addr = await _wait_for_service(tunnel_server, service_name)
+            self.assertEqual((await tunnel_server.online_pool_clients())[token], second_addr)
+
+            reader, writer = await asyncio.open_connection(*second_addr)
+            writer.write(b"x")
+            await writer.drain()
+            self.assertEqual(await reader.read(6), b"second")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            for task in (first_task, second_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+            await tunnel_server.close()
+            first_local.close()
+            second_local.close()
+            await first_local.wait_closed()
+            await second_local.wait_closed()
+
 
 async def _wait_for_service(server: Server, name: str) -> tuple[str, int]:
     for _ in range(100):
@@ -345,6 +516,15 @@ async def _wait_for_service(server: Server, name: str) -> tuple[str, int]:
             return address
         await asyncio.sleep(0.02)
     raise AssertionError(f"service {name!r} was not registered")
+
+
+async def _wait_for_task_done(task: asyncio.Task[None]) -> None:
+    for _ in range(100):
+        if task.done():
+            await task
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("task did not finish")
 
 
 if __name__ == "__main__":

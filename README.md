@@ -59,6 +59,36 @@ py-frp client -c examples/frpc.toml
 ssh -p 6000 user@your-server
 ```
 
+## 免配置端口池模式
+
+服务端不需要配置文件，只指定控制端口和公网端口池：
+
+```bash
+py-frp server --bind-port 7000 --port-pool 6000-6009
+```
+
+启动后服务端会在 stdout 输出一组随机 token。token 只使用容易分辨的字母数字，并排除 `I`、`O`、`0`、`1`、`l`。管理员把 token 记录下来发给客户端。
+
+客户端只需要目标服务端和 token 即可连接；本地目标默认是 `127.0.0.1:22`：
+
+```bash
+py-frp client --server your-server:7000 --token TOKEN_FROM_SERVER
+```
+
+客户端注册成功后会把服务端分配到的远程端口输出到 stdout，例如：
+
+```text
+6003
+```
+
+如果本地目标不是 SSH，可以显式指定：
+
+```bash
+py-frp client --server your-server:7000 --token TOKEN_FROM_SERVER --local 127.0.0.1:8080
+```
+
+同一个 token 同时只允许一个在线客户端。新客户端使用同一个 token 登录时，服务端会关闭旧客户端并释放旧的公网端口，再从端口池中分配一个可用端口给新客户端。
+
 ## frp 配置子集
 
 服务端 `frps.toml`：
@@ -144,6 +174,7 @@ py-frp server -c frps.toml --no-auto-elevate
 - TCP 反向端口映射
 - 多服务/多 proxy
 - token 鉴权
+- 免配置 token 端口池模式
 - frp TOML 和 legacy INI 的常见 TCP 配置
 - rathole TOML 的常见 TCP 配置
 - `pip install .` 一键安装和 console scripts

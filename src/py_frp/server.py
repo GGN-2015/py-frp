@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import ServerConfig, ServerServiceConfig
+from .pool import token_service_name
 from .protocol import ProtocolError, close_writer, pipe_streams, read_message, write_message
 
 
@@ -39,6 +40,7 @@ class RegisteredService:
     client: ClientSession
     listener: asyncio.AbstractServer
     configured: bool
+    pool_token: str | None = None
 
     @property
     def public_address(self) -> tuple[str, int]:
@@ -63,8 +65,10 @@ class Server:
     def __init__(self, config: ServerConfig):
         self.config = config
         self._configured = {service.name: service for service in config.services}
+        self._pool_tokens = set(config.pool_tokens)
         self._services: dict[str, RegisteredService] = {}
         self._pending: dict[str, PendingTunnel] = {}
+        self._pool_clients: dict[str, ClientSession] = {}
         self._lock = asyncio.Lock()
         self._server: asyncio.AbstractServer | None = None
 
@@ -116,6 +120,14 @@ class Server:
         service = self._services.get(name)
         return None if service is None else service.public_address
 
+    async def online_pool_clients(self) -> dict[str, tuple[str, int]]:
+        async with self._lock:
+            return {
+                token: self._services[token_service_name(token)].public_address
+                for token in self._pool_clients
+                if token_service_name(token) in self._services
+            }
+
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
@@ -133,7 +145,7 @@ class Server:
             await self._handle_control(first, reader, writer)
         except (ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.debug("connection rejected: %s", exc)
-            await _best_effort_error(writer, str(exc))
+            await _best_effort_error(writer, str(exc), fatal=isinstance(exc, AuthenticationError))
             await close_writer(writer)
         except Exception as exc:
             LOGGER.exception("connection handler crashed")
@@ -186,7 +198,7 @@ class Server:
                     LOGGER.debug("ignored control message from %s: %s", client.id, message)
         except (ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.warning("client %s disconnected: %s", client.id, exc)
-            await _best_effort_error(writer, str(exc))
+            await _best_effort_error(writer, str(exc), fatal=isinstance(exc, AuthenticationError))
         except Exception as exc:
             LOGGER.exception("client %s handler crashed", client.id)
             await _best_effort_error(writer, str(exc))
@@ -205,41 +217,140 @@ class Server:
         registered: list[RegisteredService] = []
         try:
             for raw in raw_services:
-                service = self._service_from_registration(raw)
-                listener = await asyncio.start_server(
-                    lambda reader, writer, name=service.name: self._handle_public(name, reader, writer),
-                    service.bind_host,
-                    service.bind_port,
-                )
-                registered_service = RegisteredService(
-                    name=service.name,
-                    bind_host=service.bind_host,
-                    bind_port=service.bind_port,
-                    token=service.token,
-                    client=client,
-                    listener=listener,
-                    configured=service.name in self._configured,
-                )
-                async with self._lock:
-                    if service.name in self._services:
-                        listener.close()
-                        await listener.wait_closed()
-                        raise ProtocolError(f"service {service.name!r} is already registered")
-                    self._services[service.name] = registered_service
+                if self._is_pool_registration(raw):
+                    registered_service = await self._register_pool_service(client, raw)
+                else:
+                    registered_service = await self._register_regular_service(client, raw)
                 registered.append(registered_service)
                 LOGGER.info(
                     "service %s listening on %s",
-                    service.name,
-                    _server_addresses(listener),
+                    registered_service.name,
+                    _server_addresses(registered_service.listener),
                 )
         except Exception:
             for item in registered:
-                async with self._lock:
-                    self._services.pop(item.name, None)
-                item.listener.close()
-                await item.listener.wait_closed()
+                await self._drop_registered_service(item)
             raise
         return registered
+
+    async def _register_regular_service(
+        self,
+        client: ClientSession,
+        raw: Any,
+    ) -> RegisteredService:
+        service = self._service_from_registration(raw)
+        listener = await asyncio.start_server(
+            lambda reader, writer, name=service.name: self._handle_public(name, reader, writer),
+            service.bind_host,
+            service.bind_port,
+        )
+        registered_service = RegisteredService(
+            name=service.name,
+            bind_host=service.bind_host,
+            bind_port=service.bind_port,
+            token=service.token,
+            client=client,
+            listener=listener,
+            configured=service.name in self._configured,
+        )
+        async with self._lock:
+            if service.name in self._services:
+                listener.close()
+                await listener.wait_closed()
+                raise ProtocolError(f"service {service.name!r} is already registered")
+            self._services[service.name] = registered_service
+        return registered_service
+
+    async def _register_pool_service(
+        self,
+        client: ClientSession,
+        raw: Any,
+    ) -> RegisteredService:
+        if not isinstance(raw, dict):
+            raise ProtocolError("service registration must be an object")
+        token = _optional_string(raw.get("token"))
+        if token not in self._pool_tokens:
+            raise AuthenticationError("authentication failed")
+
+        await self._kick_pool_client(token, client)
+        service_name = token_service_name(token)
+        last_error: OSError | None = None
+
+        async with self._lock:
+            if self._pool_clients.get(token) is not None:
+                raise ProtocolError("token is still online")
+            used_ports = {
+                service.bind_port
+                for service in self._services.values()
+                if service.pool_token is not None
+            }
+            for port in self.config.port_pool:
+                if port in used_ports:
+                    continue
+                try:
+                    listener = await asyncio.start_server(
+                        lambda reader, writer, name=service_name: self._handle_public(name, reader, writer),
+                        self.config.pool_bind_host,
+                        port,
+                    )
+                except OSError as exc:
+                    last_error = exc
+                    LOGGER.warning("pool port %d is unavailable: %s", port, exc)
+                    continue
+
+                registered_service = RegisteredService(
+                    name=service_name,
+                    bind_host=self.config.pool_bind_host,
+                    bind_port=port,
+                    token=token,
+                    client=client,
+                    listener=listener,
+                    configured=True,
+                    pool_token=token,
+                )
+                self._services[service_name] = registered_service
+                self._pool_clients[token] = client
+                return registered_service
+
+        if last_error is not None:
+            raise ProtocolError("no available port in the configured pool") from last_error
+        raise ProtocolError("no available port in the configured pool")
+
+    def _is_pool_registration(self, raw: Any) -> bool:
+        if not self.config.port_pool:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        if raw.get("remote_port") is not None or raw.get("remotePort") is not None:
+            return False
+        return True
+
+    async def _kick_pool_client(self, token: str, new_client: ClientSession) -> None:
+        async with self._lock:
+            old_client = self._pool_clients.get(token)
+        if old_client is None or old_client is new_client:
+            return
+        LOGGER.info("token %s logged in again; disconnecting previous client", _token_label(token))
+        try:
+            await old_client.send(
+                {
+                    "type": "error",
+                    "error": "token logged in from another client",
+                    "fatal": True,
+                }
+            )
+        except (ConnectionError, OSError, ProtocolError):
+            pass
+        await close_writer(old_client.writer)
+        await self._remove_client(old_client)
+
+    async def _drop_registered_service(self, service: RegisteredService) -> None:
+        async with self._lock:
+            self._services.pop(service.name, None)
+            if service.pool_token is not None and self._pool_clients.get(service.pool_token) is service.client:
+                self._pool_clients.pop(service.pool_token, None)
+        service.listener.close()
+        await service.listener.wait_closed()
 
     def _service_from_registration(self, raw: Any) -> ServerServiceConfig:
         if not isinstance(raw, dict):
@@ -274,6 +385,8 @@ class Server:
             services = [item for item in self._services.values() if item.client is client]
             for service in services:
                 self._services.pop(service.name, None)
+                if service.pool_token is not None and self._pool_clients.get(service.pool_token) is client:
+                    self._pool_clients.pop(service.pool_token, None)
             pending = [item for item in self._pending.values() if item.client is client]
             for item in pending:
                 self._pending.pop(item.id, None)
@@ -369,11 +482,16 @@ class Server:
         LOGGER.debug("paired tunnel %s for service %s", tunnel_id, service_name)
 
 
-async def _best_effort_error(writer: asyncio.StreamWriter, error: str) -> None:
+async def _best_effort_error(
+    writer: asyncio.StreamWriter,
+    error: str,
+    *,
+    fatal: bool = False,
+) -> None:
     if writer.is_closing():
         return
     try:
-        await write_message(writer, {"type": "error", "error": error})
+        await write_message(writer, {"type": "error", "error": error, "fatal": fatal})
     except Exception:
         pass
 
@@ -403,3 +521,7 @@ def _port(value: Any) -> int:
 def _server_addresses(server: asyncio.AbstractServer) -> str:
     sockets = server.sockets or ()
     return ", ".join(f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in sockets)
+
+
+def _token_label(token: str) -> str:
+    return token_service_name(token).removeprefix("token-")
