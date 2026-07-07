@@ -7,7 +7,7 @@
 从 PyPI 安装：
 
 ```bash
-pip install ggn-nat-tunnel
+pip install py-simple-nat-tunnel
 ```
 
 从源码安装：
