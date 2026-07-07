@@ -1,0 +1,4 @@
+bindPort = 7000
+
+[auth]
+token = "change-me"
