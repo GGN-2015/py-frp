@@ -147,7 +147,7 @@ def _load_server_command_config(args: argparse.Namespace) -> ServerConfig:
     if not args.port_pool:
         raise ConfigError("server requires --config or --port-pool")
     ports = parse_port_pools(args.port_pool)
-    tokens = generate_tokens(len(ports), length=args.token_length)
+    tokens = generate_tokens(1, length=args.token_length)
     return ServerConfig(
         bind_host=args.bind_host,
         bind_port=args.bind_port,
@@ -221,8 +221,8 @@ def _print_token_pool(config: ServerConfig) -> None:
     print("py-frp token pool", flush=True)
     print(f"control {config.bind_host}:{config.bind_port}", flush=True)
     print(f"public_bind {config.pool_bind_host}", flush=True)
-    for index, token in enumerate(config.pool_tokens, start=1):
-        print(f"token {index} {token}", flush=True)
+    for token in config.pool_tokens:
+        print(f"token {token}", flush=True)
 
 
 def _print_assigned_ports(message: dict[str, object]) -> None:

@@ -25,7 +25,8 @@ class Client:
     ):
         self.config = config
         self.on_registered = on_registered
-        self._proxies = {proxy.name: proxy for proxy in config.proxies}
+        self._base_proxies = {proxy.name: proxy for proxy in config.proxies}
+        self._proxies = dict(self._base_proxies)
         self._tasks: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
@@ -65,6 +66,7 @@ class Client:
             _raise_error_response(registered)
             if registered.get("type") != "registered" or registered.get("status") != "ok":
                 raise ProtocolError(f"unexpected register response: {registered!r}")
+            self._apply_registered_aliases(registered)
             LOGGER.info("registered %d service(s)", len(self.config.proxies))
             if self.on_registered is not None:
                 self.on_registered(registered)
@@ -139,6 +141,18 @@ class Client:
                 payload["remote_port"] = proxy.remote_port
             payloads.append(payload)
         return payloads
+
+    def _apply_registered_aliases(self, message: dict[str, Any]) -> None:
+        self._proxies = dict(self._base_proxies)
+        services = message.get("services")
+        if not isinstance(services, list) or len(services) != len(self.config.proxies):
+            return
+        for raw, proxy in zip(services, self.config.proxies):
+            if not isinstance(raw, dict):
+                continue
+            name = raw.get("name")
+            if isinstance(name, str) and name:
+                self._proxies[name] = proxy
 
     async def _open_tunnel(self, message: dict[str, Any]) -> None:
         tunnel_id = str(message.get("id") or "")

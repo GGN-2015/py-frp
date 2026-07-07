@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import ServerConfig, ServerServiceConfig
-from .pool import token_service_name
 from .protocol import ProtocolError, close_writer, pipe_streams, read_message, write_message
 
 
@@ -18,6 +17,10 @@ LOGGER = logging.getLogger(__name__)
 
 class AuthenticationError(ProtocolError):
     """Raised when a peer presents a wrong token."""
+
+
+class ResourceExhaustedError(ProtocolError):
+    """Raised when no pool port can be assigned to a client."""
 
 
 @dataclass
@@ -68,7 +71,6 @@ class Server:
         self._pool_tokens = set(config.pool_tokens)
         self._services: dict[str, RegisteredService] = {}
         self._pending: dict[str, PendingTunnel] = {}
-        self._pool_clients: dict[str, ClientSession] = {}
         self._lock = asyncio.Lock()
         self._server: asyncio.AbstractServer | None = None
 
@@ -123,9 +125,9 @@ class Server:
     async def online_pool_clients(self) -> dict[str, tuple[str, int]]:
         async with self._lock:
             return {
-                token: self._services[token_service_name(token)].public_address
-                for token in self._pool_clients
-                if token_service_name(token) in self._services
+                service.name: service.public_address
+                for service in self._services.values()
+                if service.pool_token is not None
             }
 
     async def _handle_connection(
@@ -198,7 +200,11 @@ class Server:
                     LOGGER.debug("ignored control message from %s: %s", client.id, message)
         except (ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.warning("client %s disconnected: %s", client.id, exc)
-            await _best_effort_error(writer, str(exc), fatal=isinstance(exc, AuthenticationError))
+            await _best_effort_error(
+                writer,
+                str(exc),
+                fatal=isinstance(exc, (AuthenticationError, ResourceExhaustedError)),
+            )
         except Exception as exc:
             LOGGER.exception("client %s handler crashed", client.id)
             await _best_effort_error(writer, str(exc))
@@ -272,19 +278,16 @@ class Server:
         if token not in self._pool_tokens:
             raise AuthenticationError("authentication failed")
 
-        await self._kick_pool_client(token, client)
-        service_name = token_service_name(token)
+        service_name = _pool_service_name(client)
         last_error: OSError | None = None
 
         async with self._lock:
-            if self._pool_clients.get(token) is not None:
-                raise ProtocolError("token is still online")
             used_ports = {
                 service.bind_port
                 for service in self._services.values()
                 if service.pool_token is not None
             }
-            for port in self.config.port_pool:
+            for port in sorted(self.config.port_pool):
                 if port in used_ports:
                     continue
                 try:
@@ -309,12 +312,13 @@ class Server:
                     pool_token=token,
                 )
                 self._services[service_name] = registered_service
-                self._pool_clients[token] = client
                 return registered_service
 
         if last_error is not None:
-            raise ProtocolError("no available port in the configured pool") from last_error
-        raise ProtocolError("no available port in the configured pool")
+            raise ResourceExhaustedError(
+                "resource insufficient: no available port in the configured pool"
+            ) from last_error
+        raise ResourceExhaustedError("resource insufficient: no available port in the configured pool")
 
     def _is_pool_registration(self, raw: Any) -> bool:
         if not self.config.port_pool:
@@ -325,30 +329,9 @@ class Server:
             return False
         return True
 
-    async def _kick_pool_client(self, token: str, new_client: ClientSession) -> None:
-        async with self._lock:
-            old_client = self._pool_clients.get(token)
-        if old_client is None or old_client is new_client:
-            return
-        LOGGER.info("token %s logged in again; disconnecting previous client", _token_label(token))
-        try:
-            await old_client.send(
-                {
-                    "type": "error",
-                    "error": "token logged in from another client",
-                    "fatal": True,
-                }
-            )
-        except (ConnectionError, OSError, ProtocolError):
-            pass
-        await close_writer(old_client.writer)
-        await self._remove_client(old_client)
-
     async def _drop_registered_service(self, service: RegisteredService) -> None:
         async with self._lock:
             self._services.pop(service.name, None)
-            if service.pool_token is not None and self._pool_clients.get(service.pool_token) is service.client:
-                self._pool_clients.pop(service.pool_token, None)
         service.listener.close()
         await service.listener.wait_closed()
 
@@ -385,8 +368,6 @@ class Server:
             services = [item for item in self._services.values() if item.client is client]
             for service in services:
                 self._services.pop(service.name, None)
-                if service.pool_token is not None and self._pool_clients.get(service.pool_token) is client:
-                    self._pool_clients.pop(service.pool_token, None)
             pending = [item for item in self._pending.values() if item.client is client]
             for item in pending:
                 self._pending.pop(item.id, None)
@@ -523,5 +504,5 @@ def _server_addresses(server: asyncio.AbstractServer) -> str:
     return ", ".join(f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in sockets)
 
 
-def _token_label(token: str) -> str:
-    return token_service_name(token).removeprefix("token-")
+def _pool_service_name(client: ClientSession) -> str:
+    return f"pool-{client.id}"
