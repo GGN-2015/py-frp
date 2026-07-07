@@ -35,10 +35,8 @@ class Client:
                 await asyncio.sleep(self.config.reconnect_delay)
 
     async def _run_once(self) -> None:
-        reader, writer = await asyncio.open_connection(
-            self.config.server_host,
-            self.config.server_port,
-        )
+        reader, writer = await self._open_server_connection()
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
             await write_message(writer, {"type": "hello", "version": 1, "client": "py-frp"})
             hello = await read_message(reader)
@@ -52,15 +50,15 @@ class Client:
             if registered.get("type") != "registered" or registered.get("status") != "ok":
                 raise ProtocolError(f"unexpected register response: {registered!r}")
             LOGGER.info("registered %d service(s)", len(self.config.proxies))
+            heartbeat_task = asyncio.create_task(self._heartbeat(writer))
 
             while True:
-                message = await read_message(reader)
+                message = await self._read_control_message(reader, heartbeat_task)
                 if message is None:
                     raise ConnectionError("control connection closed")
                 if message.get("type") == "open":
                     task = asyncio.create_task(self._open_tunnel(message))
-                    self._tasks.add(task)
-                    task.add_done_callback(self._tasks.discard)
+                    self._track_tunnel_task(task)
                 elif message.get("type") == "pong":
                     LOGGER.debug("received pong")
                 elif message.get("type") == "error":
@@ -68,7 +66,47 @@ class Client:
                 else:
                     LOGGER.debug("ignored control message: %s", message)
         finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
             await close_writer(writer)
+
+    async def _open_server_connection(
+        self,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await asyncio.wait_for(
+            asyncio.open_connection(self.config.server_host, self.config.server_port),
+            timeout=self.config.connect_timeout,
+        )
+
+    async def _read_control_message(
+        self,
+        reader: asyncio.StreamReader,
+        heartbeat_task: asyncio.Task[None],
+    ) -> dict[str, Any] | None:
+        read_task = asyncio.create_task(read_message(reader))
+        try:
+            done, _ = await asyncio.wait(
+                {read_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                read_task.cancel()
+                await asyncio.gather(read_task, return_exceptions=True)
+                exc = heartbeat_task.exception()
+                if exc is not None:
+                    raise ConnectionError("control heartbeat failed") from exc
+                raise ConnectionError("control heartbeat stopped")
+            return read_task.result()
+        finally:
+            if not read_task.done():
+                read_task.cancel()
+                await asyncio.gather(read_task, return_exceptions=True)
+
+    async def _heartbeat(self, writer: asyncio.StreamWriter) -> None:
+        while True:
+            await asyncio.sleep(self.config.heartbeat_interval)
+            await write_message(writer, {"type": "ping", "time": time.time()})
 
     def _service_payloads(self) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
@@ -98,18 +136,15 @@ class Client:
         local_error: str | None = None
         try:
             try:
-                local_reader, local_writer = await asyncio.open_connection(
-                    proxy.local_host,
-                    proxy.local_port,
+                local_reader, local_writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy.local_host, proxy.local_port),
+                    timeout=self.config.connect_timeout,
                 )
-            except (ConnectionError, OSError) as exc:
+            except (asyncio.TimeoutError, ConnectionError, OSError) as exc:
                 local_error = str(exc)
                 LOGGER.warning("cannot connect local service %s: %s", service_name, exc)
 
-            tunnel_reader, tunnel_writer = await asyncio.open_connection(
-                self.config.server_host,
-                self.config.server_port,
-            )
+            tunnel_reader, tunnel_writer = await self._open_server_connection()
             await write_message(
                 tunnel_writer,
                 {
@@ -124,11 +159,24 @@ class Client:
             if local_reader is None or local_writer is None:
                 return
             await pipe_streams(local_reader, local_writer, tunnel_reader, tunnel_writer)
-        except (ConnectionError, OSError, ProtocolError) as exc:
+        except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError) as exc:
             LOGGER.debug("tunnel %s for %s closed: %s", tunnel_id, service_name, exc)
         finally:
             await close_writer(local_writer)
             await close_writer(tunnel_writer)
+
+    def _track_tunnel_task(self, task: asyncio.Task[None]) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._on_tunnel_task_done)
+
+    def _on_tunnel_task_done(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            LOGGER.exception("tunnel task crashed")
 
     async def _cancel_tunnel_tasks(self) -> None:
         tasks = list(self._tasks)

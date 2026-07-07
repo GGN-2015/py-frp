@@ -41,6 +41,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ElevationError as exc:
         LOGGER.error("elevation failed: %s", exc)
         return 1
+    except Exception:
+        LOGGER.exception("fatal runtime error")
+        return 1
     return 2
 
 

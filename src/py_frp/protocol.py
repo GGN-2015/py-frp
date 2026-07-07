@@ -64,17 +64,35 @@ async def pipe_streams(
 ) -> None:
     left_to_right = asyncio.create_task(_copy_stream(left_reader, right_writer))
     right_to_left = asyncio.create_task(_copy_stream(right_reader, left_writer))
-    tasks = {left_to_right, right_to_left}
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    pending = {left_to_right, right_to_left}
+    cancel_remaining = False
 
-    for task in done:
-        exc = task.exception()
-        if exc is not None and not isinstance(exc, ConnectionError):
-            LOGGER.debug("stream relay ended with %r", exc)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    cancel_remaining = True
+                    raise
+                except (ConnectionError, OSError) as exc:
+                    LOGGER.debug("stream relay disconnected: %r", exc)
+                    cancel_remaining = True
+                except Exception as exc:
+                    LOGGER.debug("stream relay ended with %r", exc)
+                    cancel_remaining = True
+            if cancel_remaining:
+                break
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
     await asyncio.gather(
         close_writer(left_writer),
         close_writer(right_writer),

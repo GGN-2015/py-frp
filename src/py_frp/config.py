@@ -54,6 +54,8 @@ class ClientConfig:
     token: str | None = None
     source_flavor: str = "py-frp"
     reconnect_delay: float = 3.0
+    connect_timeout: float = 10.0
+    heartbeat_interval: float = 30.0
 
 
 def load_server_config(path: str | Path) -> ServerConfig:
@@ -101,12 +103,17 @@ def describe_client_config(config: ClientConfig) -> str:
 
 def _load_mapping_file(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
-    if suffix == ".json":
-        with path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-    else:
-        with path.open("rb") as file:
-            data = tomllib.load(file)
+    try:
+        if suffix == ".json":
+            with path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        else:
+            with path.open("rb") as file:
+                data = tomllib.load(file)
+    except OSError as exc:
+        raise ConfigError(f"cannot read configuration file {path}: {exc}") from exc
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"invalid configuration syntax in {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError("configuration root must be a table/object")
     return data
@@ -125,6 +132,7 @@ def _load_frp_or_native_server(data: Mapping[str, Any]) -> ServerConfig:
         _get_any(root, "token", "auth_token", "authToken", default=_auth_token(root))
     )
     allow_dynamic = _bool(_get_any(root, "allow_dynamic", "allowDynamic"), True)
+    open_timeout = _positive_float(_get_any(root, "open_timeout", "openTimeout"), 15.0)
     source = "py-frp" if _get_any(data, "mode") else "frp"
 
     services = tuple(_native_server_services(root, token))
@@ -135,6 +143,7 @@ def _load_frp_or_native_server(data: Mapping[str, Any]) -> ServerConfig:
         services=services,
         allow_dynamic=allow_dynamic,
         source_flavor=source,
+        open_timeout=open_timeout,
     )
 
 
@@ -145,7 +154,12 @@ def _load_frp_or_native_client(data: Mapping[str, Any]) -> ClientConfig:
     server_host, server_port = _addr_from_fields(server_addr, default_host, default_port)
 
     token = _string_or_none(_get_any(data, "token", default=_auth_token(data)))
-    reconnect_delay = float(_get_any(data, "reconnect_delay", "reconnectDelay") or 3.0)
+    reconnect_delay = _positive_float(_get_any(data, "reconnect_delay", "reconnectDelay"), 3.0)
+    connect_timeout = _positive_float(_get_any(data, "connect_timeout", "connectTimeout"), 10.0)
+    heartbeat_interval = _positive_float(
+        _get_any(data, "heartbeat_interval", "heartbeatInterval"),
+        30.0,
+    )
     proxy_rows = _get_any(data, "proxies", "services", default=())
     if isinstance(proxy_rows, Mapping):
         proxy_rows = [
@@ -167,6 +181,8 @@ def _load_frp_or_native_client(data: Mapping[str, Any]) -> ClientConfig:
         proxies=tuple(proxies),
         source_flavor=source,
         reconnect_delay=reconnect_delay,
+        connect_timeout=connect_timeout,
+        heartbeat_interval=heartbeat_interval,
     )
 
 
@@ -177,6 +193,7 @@ def _load_rathole_server(data: Mapping[str, Any]) -> ServerConfig:
         default_host="0.0.0.0",
     )
     default_token = _string_or_none(_get_any(server, "default_token", "defaultToken"))
+    open_timeout = _positive_float(_get_any(server, "open_timeout", "openTimeout"), 15.0)
     services_table = _as_mapping(_get_any(server, "services"), default={})
     services: list[ServerServiceConfig] = []
 
@@ -202,6 +219,7 @@ def _load_rathole_server(data: Mapping[str, Any]) -> ServerConfig:
         services=tuple(services),
         allow_dynamic=_bool(_get_any(server, "allow_dynamic", "allowDynamic"), False),
         source_flavor="rathole",
+        open_timeout=open_timeout,
     )
 
 
@@ -212,6 +230,12 @@ def _load_rathole_client(data: Mapping[str, Any]) -> ClientConfig:
         default_host="127.0.0.1",
     )
     default_token = _string_or_none(_get_any(client, "default_token", "defaultToken"))
+    reconnect_delay = _positive_float(_get_any(client, "reconnect_delay", "reconnectDelay"), 3.0)
+    connect_timeout = _positive_float(_get_any(client, "connect_timeout", "connectTimeout"), 10.0)
+    heartbeat_interval = _positive_float(
+        _get_any(client, "heartbeat_interval", "heartbeatInterval"),
+        30.0,
+    )
     services_table = _as_mapping(_get_any(client, "services"), default={})
     proxies: list[ProxyConfig] = []
 
@@ -238,6 +262,9 @@ def _load_rathole_client(data: Mapping[str, Any]) -> ClientConfig:
         token=default_token,
         proxies=tuple(proxies),
         source_flavor="rathole",
+        reconnect_delay=reconnect_delay,
+        connect_timeout=connect_timeout,
+        heartbeat_interval=heartbeat_interval,
     )
 
 
@@ -246,7 +273,7 @@ def _load_frp_ini_server(path: Path) -> ServerConfig:
     common = parser["common"] if parser.has_section("common") else parser.defaults()
     bind_addr = common.get("bind_addr")
     bind_host = common.get("bind_host", "0.0.0.0")
-    bind_port = int(common.get("bind_port", "7000"))
+    bind_port = _int(common.get("bind_port", "7000"), 7000)
     if bind_addr and ":" in bind_addr:
         bind_host, bind_port = _split_addr(bind_addr, default_host="0.0.0.0")
     elif bind_addr:
@@ -268,7 +295,7 @@ def _load_frp_ini_client(path: Path) -> ClientConfig:
         raise ConfigError("frp ini client config requires a [common] section")
     common = parser["common"]
     server_host = common.get("server_addr", "127.0.0.1")
-    server_port = int(common.get("server_port", "7000"))
+    server_port = _int(common.get("server_port", "7000"), 7000)
     token = _empty_to_none(common.get("token") or common.get("auth_token"))
     proxies: list[ProxyConfig] = []
 
@@ -284,9 +311,9 @@ def _load_frp_ini_client(path: Path) -> ClientConfig:
             local_host, local_port = _split_addr(local_addr, default_host="127.0.0.1")
         else:
             local_host = row.get("local_ip", row.get("local_host", "127.0.0.1"))
-            local_port = int(_required_value(row, "local_port", section))
+            local_port = _int(_required_value(row, "local_port", section), 0)
         remote_host = row.get("remote_host") or row.get("remote_ip") or "0.0.0.0"
-        remote_port = int(_required_value(row, "remote_port", section))
+        remote_port = _int(_required_value(row, "remote_port", section), 0)
         proxies.append(
             ProxyConfig(
                 name=_service_name(section),
@@ -449,24 +476,43 @@ def _split_addr(value: str, *, default_host: str) -> tuple[str, int]:
         match = re.fullmatch(r"\[([^\]]+)\]:(\d+)", value)
         if not match:
             raise ConfigError(f"invalid address {value!r}")
-        return match.group(1), int(match.group(2))
+        return match.group(1), _int(match.group(2), 0)
     if ":" not in value:
         raise ConfigError(f"address {value!r} must include a port")
     host, port_text = value.rsplit(":", 1)
-    return host or default_host, int(port_text)
+    return host or default_host, _int(port_text, 0)
 
 
 def _port(value: int, *, allow_zero: bool) -> int:
     lower = 0 if allow_zero else 1
-    if not lower <= int(value) <= 65535:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"port {value!r} is not an integer") from exc
+    if not lower <= port <= 65535:
         raise ConfigError(f"port {value!r} is outside the valid range")
-    return int(value)
+    return port
 
 
 def _int(value: Any, default: int) -> int:
     if value is None:
         return default
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"value {value!r} is not an integer") from exc
+
+
+def _positive_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"value {value!r} is not a number") from exc
+    if result <= 0:
+        raise ConfigError(f"value {value!r} must be greater than zero")
+    return result
 
 
 def _string(value: Any, default: str | None = None) -> str:

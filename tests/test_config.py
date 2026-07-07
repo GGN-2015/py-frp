@@ -164,6 +164,29 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "outside the valid range"):
                 load_client_config(path)
 
+    def test_rejects_non_integer_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frpc.toml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    serverAddr = "127.0.0.1"
+                    serverPort = 7000
+
+                    [[proxies]]
+                    name = "ssh"
+                    type = "tcp"
+                    localIP = "127.0.0.1"
+                    localPort = "not-a-port"
+                    remotePort = 6000
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "not an integer"):
+                load_client_config(path)
+
 
 if __name__ == "__main__":
     unittest.main()

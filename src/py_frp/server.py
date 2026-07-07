@@ -124,6 +124,7 @@ class Server:
         try:
             first = await read_message(reader)
             if first is None:
+                await close_writer(writer)
                 return
             message_type = first.get("type")
             if message_type == "tunnel":
@@ -132,6 +133,10 @@ class Server:
             await self._handle_control(first, reader, writer)
         except (ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.debug("connection rejected: %s", exc)
+            await _best_effort_error(writer, str(exc))
+            await close_writer(writer)
+        except Exception as exc:
+            LOGGER.exception("connection handler crashed")
             await _best_effort_error(writer, str(exc))
             await close_writer(writer)
 
@@ -181,6 +186,9 @@ class Server:
                     LOGGER.debug("ignored control message from %s: %s", client.id, message)
         except (ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.warning("client %s disconnected: %s", client.id, exc)
+            await _best_effort_error(writer, str(exc))
+        except Exception as exc:
+            LOGGER.exception("client %s handler crashed", client.id)
             await _best_effort_error(writer, str(exc))
         finally:
             await self._remove_client(client)
@@ -324,6 +332,8 @@ class Server:
             await pipe_streams(reader, writer, tunnel_reader, tunnel_writer)
         except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError) as exc:
             LOGGER.debug("public connection for %s closed: %s", service_name, exc)
+        except Exception:
+            LOGGER.exception("public connection for %s crashed", service_name)
         finally:
             async with self._lock:
                 if self._pending.get(tunnel_id) is pending:
@@ -353,8 +363,9 @@ class Server:
             raise ProtocolError("tunnel service does not match pending connection")
         _require_token(pending.token, provided_token)
 
-        if not pending.future.done():
-            pending.future.set_result((reader, writer))
+        if pending.future.done():
+            raise ProtocolError("pending tunnel is no longer open")
+        pending.future.set_result((reader, writer))
         LOGGER.debug("paired tunnel %s for service %s", tunnel_id, service_name)
 
 
@@ -380,7 +391,10 @@ def _optional_string(value: Any) -> str | None:
 
 
 def _port(value: Any) -> int:
-    port = int(value)
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("remote_port must be an integer") from exc
     if not 0 <= port <= 65535:
         raise ProtocolError("remote_port is outside the valid range")
     return port

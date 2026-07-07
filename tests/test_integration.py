@@ -138,6 +138,129 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             echo_server.close()
             await echo_server.wait_closed()
 
+    async def test_half_closed_public_connection_can_receive_response(self) -> None:
+        async def eof_response(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            data = await reader.read()
+            writer.write(b"after-eof:" + data)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        local_server = await asyncio.start_server(eof_response, "127.0.0.1", 0)
+        local_port = int(local_server.sockets[0].getsockname()[1])
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                token="secret",
+                allow_dynamic=True,
+            )
+        )
+        await tunnel_server.start()
+        control_port = tunnel_server.control_addresses()[0][1]
+        client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=control_port,
+                token="secret",
+                reconnect_delay=0.1,
+                proxies=(
+                    ProxyConfig(
+                        name="eof",
+                        local_host="127.0.0.1",
+                        local_port=local_port,
+                        remote_host="127.0.0.1",
+                        remote_port=0,
+                        token="secret",
+                    ),
+                ),
+            )
+        )
+        client_task = asyncio.create_task(client.run())
+        try:
+            public_addr = await _wait_for_service(tunnel_server, "eof")
+            reader, writer = await asyncio.open_connection(*public_addr)
+            if not writer.can_write_eof():
+                self.skipTest("transport does not support write_eof")
+            writer.write(b"hello")
+            await writer.drain()
+            writer.write_eof()
+            self.assertEqual(
+                await asyncio.wait_for(reader.readexactly(15), timeout=2),
+                b"after-eof:hello",
+            )
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            client_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await client_task
+            await tunnel_server.close()
+            local_server.close()
+            await local_server.wait_closed()
+
+    async def test_bad_dynamic_port_returns_error_and_server_keeps_running(self) -> None:
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                token="secret",
+                allow_dynamic=True,
+            )
+        )
+        await tunnel_server.start()
+        control_host, control_port = tunnel_server.control_addresses()[0]
+        bad_writer: asyncio.StreamWriter | None = None
+        good_writer: asyncio.StreamWriter | None = None
+        try:
+            bad_reader, bad_writer = await asyncio.open_connection(control_host, control_port)
+            await write_message(bad_writer, {"type": "hello", "version": 1})
+            self.assertEqual((await read_message(bad_reader) or {}).get("type"), "hello")
+            await write_message(
+                bad_writer,
+                {
+                    "type": "register",
+                    "services": [
+                        {
+                            "name": "bad",
+                            "token": "secret",
+                            "remote_host": "127.0.0.1",
+                            "remote_port": "not-a-port",
+                        }
+                    ],
+                },
+            )
+            error_message = await asyncio.wait_for(read_message(bad_reader), timeout=1)
+            self.assertEqual((error_message or {}).get("type"), "error")
+
+            good_reader, good_writer = await asyncio.open_connection(control_host, control_port)
+            await write_message(good_writer, {"type": "hello", "version": 1})
+            self.assertEqual((await read_message(good_reader) or {}).get("type"), "hello")
+            await write_message(
+                good_writer,
+                {
+                    "type": "register",
+                    "services": [
+                        {
+                            "name": "good",
+                            "token": "secret",
+                            "remote_host": "127.0.0.1",
+                            "remote_port": 0,
+                        }
+                    ],
+                },
+            )
+            registered = await asyncio.wait_for(read_message(good_reader), timeout=1)
+            self.assertEqual((registered or {}).get("type"), "registered")
+            self.assertIsNotNone(await _wait_for_service(tunnel_server, "good"))
+        finally:
+            await close_writer(bad_writer)
+            await close_writer(good_writer)
+            await tunnel_server.close()
+
     async def test_wrong_tunnel_token_cannot_claim_pending_connection(self) -> None:
         tunnel_server = Server(
             ServerConfig(
