@@ -34,6 +34,25 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(token), 16)
             self.assertTrue(set(token) <= set(TOKEN_ALPHABET))
 
+    def test_configless_server_merges_repeated_port_pools(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "server",
+                "--port-pool",
+                "6000-6002",
+                "--port-pool",
+                "6002,6004",
+                "--port-pool",
+                "6003",
+            ]
+        )
+
+        config = _load_server_command_config(args)
+
+        self.assertEqual(config.port_pool, (6000, 6001, 6002, 6004, 6003))
+        self.assertEqual(len(config.pool_tokens), 5)
+
     def test_configless_client_uses_token_service_name(self) -> None:
         parser = build_parser()
         args = parser.parse_args(

@@ -19,7 +19,7 @@ from .config import (
     load_server_config,
 )
 from .elevate import ElevationError, is_admin, relaunch_once, should_elevate_server
-from .pool import generate_tokens, parse_port_pool, token_service_name
+from .pool import generate_tokens, parse_port_pools, token_service_name
 from .server import Server
 
 
@@ -74,7 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     server.add_argument("--bind-port", type=int, default=7000, help="control bind port for configless mode")
     server.add_argument(
         "--port-pool",
-        help="comma-separated public ports/ranges for configless token-pool mode, e.g. 6000-6010,7000",
+        action="append",
+        help=(
+            "repeatable public ports/ranges for configless token-pool mode, "
+            "e.g. --port-pool 6000-6010 --port-pool 7000"
+        ),
     )
     server.add_argument("--pool-bind-host", help="public port bind host for configless mode")
     server.add_argument("--token-length", type=int, default=24, help="generated token length")
@@ -142,7 +146,7 @@ def _load_server_command_config(args: argparse.Namespace) -> ServerConfig:
         return load_server_config(args.config)
     if not args.port_pool:
         raise ConfigError("server requires --config or --port-pool")
-    ports = parse_port_pool(args.port_pool)
+    ports = parse_port_pools(args.port_pool)
     tokens = generate_tokens(len(ports), length=args.token_length)
     return ServerConfig(
         bind_host=args.bind_host,

@@ -67,6 +67,12 @@ ssh -p 6000 user@your-server
 py-frp server --bind-port 7000 --port-pool 6000-6009
 ```
 
+`--port-pool` 可以出现多次，服务端会把所有区间和单点端口取并集；`a-b` 表示闭区间，单独的 `a` 表示加入一个端口：
+
+```bash
+py-frp server --bind-port 7000 --port-pool 6000-6009 --port-pool 7000 --port-pool 7100-7102
+```
+
 启动后服务端会在 stdout 输出一组随机 token。token 只使用容易分辨的字母数字，并排除 `I`、`O`、`0`、`1`、`l`。管理员把 token 记录下来发给客户端。
 
 客户端只需要目标服务端和 token 即可连接；本地目标默认是 `127.0.0.1:22`：

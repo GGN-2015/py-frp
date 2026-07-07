@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from py_frp.config import ConfigError, load_client_config, load_server_config
-from py_frp.pool import TOKEN_ALPHABET, generate_tokens, parse_port_pool
+from py_frp.pool import TOKEN_ALPHABET, generate_tokens, parse_port_pool, parse_port_pools
 
 
 class ConfigTests(unittest.TestCase):
@@ -190,6 +190,12 @@ class ConfigTests(unittest.TestCase):
 
     def test_parse_port_pool_ranges_and_deduplicates(self) -> None:
         self.assertEqual(parse_port_pool("6000-6002,6002,7000"), (6000, 6001, 6002, 7000))
+
+    def test_parse_port_pool_accepts_single_port(self) -> None:
+        self.assertEqual(parse_port_pool("6000"), (6000,))
+
+    def test_parse_port_pools_merges_ranges_and_single_ports(self) -> None:
+        self.assertEqual(parse_port_pools(("6000-6002", "6002,6004", "6003")), (6000, 6001, 6002, 6004, 6003))
 
     def test_generated_tokens_use_unambiguous_alphabet(self) -> None:
         tokens = generate_tokens(8, length=32)

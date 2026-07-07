@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import string
+from collections.abc import Iterable
 
 from .config import ConfigError
 
@@ -24,25 +25,30 @@ def generate_tokens(count: int, *, length: int = 24) -> tuple[str, ...]:
 
 
 def parse_port_pool(value: str) -> tuple[int, ...]:
+    return parse_port_pools((value,))
+
+
+def parse_port_pools(values: Iterable[str]) -> tuple[int, ...]:
     ports: list[int] = []
     seen: set[int] = set()
-    for part in value.split(","):
-        item = part.strip()
-        if not item:
-            continue
-        if "-" in item:
-            start_text, end_text = item.split("-", 1)
-            start = _port(start_text)
-            end = _port(end_text)
-            if end < start:
-                raise ConfigError(f"invalid descending port range {item!r}")
-            candidates = range(start, end + 1)
-        else:
-            candidates = (_port(item),)
-        for port in candidates:
-            if port not in seen:
-                seen.add(port)
-                ports.append(port)
+    for value in values:
+        for part in value.split(","):
+            item = part.strip()
+            if not item:
+                continue
+            if "-" in item:
+                start_text, end_text = item.split("-", 1)
+                start = _port(start_text)
+                end = _port(end_text)
+                if end < start:
+                    raise ConfigError(f"invalid descending port range {item!r}")
+                candidates = range(start, end + 1)
+            else:
+                candidates = (_port(item),)
+            for port in candidates:
+                if port not in seen:
+                    seen.add(port)
+                    ports.append(port)
     if not ports:
         raise ConfigError("port pool must include at least one port")
     return tuple(ports)
