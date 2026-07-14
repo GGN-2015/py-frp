@@ -101,6 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     client.add_argument("--server", help="server control address for configless mode, e.g. example.com:7000")
     client.add_argument("--token", help="token for configless mode")
     client.add_argument(
+        "--server-fingerprint",
+        help="trusted SHA-256 TLS fingerprint; omit to confirm interactively",
+    )
+    client.add_argument(
         "--local",
         default="127.0.0.1:22",
         help=(
@@ -179,6 +183,7 @@ def _load_client_command_config(args: argparse.Namespace) -> ClientConfig:
         reconnect_delay=_positive_float(args.reconnect_delay, "reconnect delay"),
         connect_timeout=_positive_float(args.connect_timeout, "connect timeout"),
         heartbeat_interval=_positive_float(args.heartbeat_interval, "heartbeat interval"),
+        server_fingerprint=args.server_fingerprint,
         proxies=(
             ProxyConfig(
                 name=token_service_name(token),

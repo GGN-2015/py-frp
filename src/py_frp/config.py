@@ -59,6 +59,7 @@ class ClientConfig:
     reconnect_delay: float = 3.0
     connect_timeout: float = 10.0
     heartbeat_interval: float = 30.0
+    server_fingerprint: str | None = None
 
 
 def load_server_config(path: str | Path) -> ServerConfig:
@@ -188,6 +189,9 @@ def _load_frp_or_native_client(data: Mapping[str, Any]) -> ClientConfig:
         reconnect_delay=reconnect_delay,
         connect_timeout=connect_timeout,
         heartbeat_interval=heartbeat_interval,
+        server_fingerprint=_string_or_none(
+            _get_any(data, "server_fingerprint", "serverFingerprint")
+        ),
     )
 
 
@@ -270,6 +274,9 @@ def _load_rathole_client(data: Mapping[str, Any]) -> ClientConfig:
         reconnect_delay=reconnect_delay,
         connect_timeout=connect_timeout,
         heartbeat_interval=heartbeat_interval,
+        server_fingerprint=_string_or_none(
+            _get_any(client, "server_fingerprint", "serverFingerprint")
+        ),
     )
 
 
@@ -338,6 +345,9 @@ def _load_frp_ini_client(path: Path) -> ClientConfig:
         token=token,
         proxies=tuple(proxies),
         source_flavor="frp-ini",
+        server_fingerprint=_empty_to_none(
+            common.get("server_fingerprint") or common.get("serverFingerprint")
+        ),
     )
 
 

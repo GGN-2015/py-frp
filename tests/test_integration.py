@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import ipaddress
 import socket
+import struct
 import unittest
 
 from py_frp.client import Client
@@ -11,12 +13,128 @@ from py_frp.cli import _load_client_command_config, build_parser
 from py_frp.config import ClientConfig, ProxyConfig, ServerConfig, ServerServiceConfig
 from py_frp.pool import token_service_name
 from py_frp.protocol import close_writer, read_message, write_message
+from py_frp.security import (
+    SecurityError,
+    create_client_tls_context,
+    fingerprints_equal,
+    peer_fingerprint,
+)
 from py_frp.server import Server
 
 
 class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await asyncio.sleep(0)
+
+    async def test_tls_fingerprint_is_printed_confirmed_and_pinned(self) -> None:
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                token="secret",
+                allow_dynamic=True,
+            )
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            await tunnel_server.start()
+        control_port = tunnel_server.control_addresses()[0][1]
+        confirmed: list[str] = []
+
+        def confirm(value: str) -> bool:
+            confirmed.append(value)
+            return True
+
+        client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=control_port,
+                token="secret",
+                proxies=(
+                    ProxyConfig(
+                        name="unused",
+                        local_host="127.0.0.1",
+                        local_port=1,
+                        remote_host="127.0.0.1",
+                        remote_port=0,
+                    ),
+                ),
+            ),
+            confirm_fingerprint=confirm,
+        )
+        writer: asyncio.StreamWriter | None = None
+        try:
+            _, writer = await client._open_server_connection()
+            self.assertEqual(confirmed, [tunnel_server.tls_fingerprint])
+            self.assertIn(
+                f"tls_fingerprint {tunnel_server.tls_fingerprint}",
+                output.getvalue(),
+            )
+            self.assertIsNotNone(writer.get_extra_info("ssl_object"))
+
+            wrong_client = Client(
+                ClientConfig(
+                    server_host="127.0.0.1",
+                    server_port=control_port,
+                    token="secret",
+                    server_fingerprint="SHA256:" + ":".join(["00"] * 32),
+                    proxies=(
+                        ProxyConfig(
+                            name="unused",
+                            local_host="127.0.0.1",
+                            local_port=1,
+                        ),
+                    ),
+                )
+            )
+            with self.assertRaisesRegex(SecurityError, "fingerprint changed"):
+                await wrong_client._open_server_connection()
+
+            rejected_client = Client(
+                ClientConfig(
+                    server_host="127.0.0.1",
+                    server_port=control_port,
+                    token="secret",
+                    proxies=(
+                        ProxyConfig(
+                            name="unused",
+                            local_host="127.0.0.1",
+                            local_port=1,
+                        ),
+                    ),
+                ),
+                confirm_fingerprint=lambda _: False,
+            )
+            with self.assertRaisesRegex(SecurityError, "fingerprint was rejected"):
+                await rejected_client._open_server_connection()
+        finally:
+            await close_writer(writer)
+            await tunnel_server.close()
+
+    async def test_plaintext_control_connection_is_rejected(self) -> None:
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                token="secret",
+                allow_dynamic=True,
+            )
+        )
+        await tunnel_server.start()
+        control_host, control_port = tunnel_server.control_addresses()[0]
+        writer: asyncio.StreamWriter | None = None
+        try:
+            reader, writer = await asyncio.open_connection(control_host, control_port)
+            writer.write(b'{"type":"hello","version":1}\n')
+            await writer.drain()
+            try:
+                response = await asyncio.wait_for(reader.read(1), timeout=1)
+            except (ConnectionError, OSError):
+                response = b""
+            self.assertEqual(response, b"")
+        finally:
+            await close_writer(writer)
+            await tunnel_server.close()
 
     async def test_tcp_reverse_tunnel_round_trip(self) -> None:
         async def echo(
@@ -65,7 +183,8 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         token="secret",
                     ),
                 ),
-            )
+            ),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         client_task = asyncio.create_task(client.run())
         try:
@@ -124,6 +243,8 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 f"127.0.0.1:{control_port}",
                 "--token",
                 token,
+                "--server-fingerprint",
+                tunnel_server.tls_fingerprint,
                 "--local",
                 f"{lan_host}:{echo_port}",
                 "--reconnect-delay",
@@ -137,6 +258,7 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         client = Client(
             client_config,
             on_registered=_capture_registered_services(assigned),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         client_task = asyncio.create_task(client.run())
         try:
@@ -194,7 +316,8 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         token="secret",
                     ),
                 ),
-            )
+            ),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         client_task = asyncio.create_task(client.run())
         try:
@@ -252,7 +375,8 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         token="secret",
                     ),
                 ),
-            )
+            ),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         client_task = asyncio.create_task(client.run())
         try:
@@ -291,7 +415,11 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         bad_writer: asyncio.StreamWriter | None = None
         good_writer: asyncio.StreamWriter | None = None
         try:
-            bad_reader, bad_writer = await asyncio.open_connection(control_host, control_port)
+            bad_reader, bad_writer = await _open_tls_connection(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+            )
             await write_message(bad_writer, {"type": "hello", "version": 1})
             self.assertEqual((await read_message(bad_reader) or {}).get("type"), "hello")
             await write_message(
@@ -311,7 +439,11 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             error_message = await asyncio.wait_for(read_message(bad_reader), timeout=1)
             self.assertEqual((error_message or {}).get("type"), "error")
 
-            good_reader, good_writer = await asyncio.open_connection(control_host, control_port)
+            good_reader, good_writer = await _open_tls_connection(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+            )
             await write_message(good_writer, {"type": "hello", "version": 1})
             self.assertEqual((await read_message(good_reader) or {}).get("type"), "hello")
             await write_message(
@@ -355,7 +487,11 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await tunnel_server.start()
         control_host, control_port = tunnel_server.control_addresses()[0]
-        control_reader, control_writer = await asyncio.open_connection(control_host, control_port)
+        control_reader, control_writer = await _open_tls_connection(
+            control_host,
+            control_port,
+            tunnel_server.tls_fingerprint,
+        )
         public_writer: asyncio.StreamWriter | None = None
         bad_tunnel_writer: asyncio.StreamWriter | None = None
         good_tunnel_writer: asyncio.StreamWriter | None = None
@@ -376,7 +512,11 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(open_message)
             tunnel_id = str(open_message["id"])
 
-            bad_reader, bad_tunnel_writer = await asyncio.open_connection(control_host, control_port)
+            bad_reader, bad_tunnel_writer = await _open_tls_connection(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+            )
             await write_message(
                 bad_tunnel_writer,
                 {
@@ -389,7 +529,11 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             error_message = await asyncio.wait_for(read_message(bad_reader), timeout=1)
             self.assertEqual((error_message or {}).get("type"), "error")
 
-            good_reader, good_tunnel_writer = await asyncio.open_connection(control_host, control_port)
+            good_reader, good_tunnel_writer = await _open_tls_connection(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+            )
             await write_message(
                 good_tunnel_writer,
                 {
@@ -401,9 +545,11 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             public_writer.write(b"secret payload")
             await public_writer.drain()
-            self.assertEqual(await asyncio.wait_for(good_reader.read(14), timeout=1), b"secret payload")
-            good_tunnel_writer.write(b"accepted")
-            await good_tunnel_writer.drain()
+            self.assertEqual(
+                await asyncio.wait_for(_read_tunnel_data(good_reader), timeout=1),
+                b"secret payload",
+            )
+            await _write_tunnel_data(good_tunnel_writer, b"accepted")
             self.assertEqual(await asyncio.wait_for(public_reader.read(8), timeout=1), b"accepted")
         finally:
             await close_writer(control_writer)
@@ -456,6 +602,7 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             on_registered=_capture_registered_services(assigned),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         client_task = asyncio.create_task(client.run())
         try:
@@ -538,6 +685,7 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             on_registered=_capture_registered_services(first_assigned),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         second_client = Client(
             ClientConfig(
@@ -555,6 +703,7 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             on_registered=_capture_registered_services(second_assigned),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         first_task = asyncio.create_task(first_client.run())
         second_task: asyncio.Task[None] | None = None
@@ -652,6 +801,7 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             on_registered=_capture_registered_services(assigned),
+            confirm_fingerprint=_confirm_fingerprint,
         )
         second_client = Client(
             ClientConfig(
@@ -667,7 +817,8 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         token=token,
                     ),
                 ),
-            )
+            ),
+            confirm_fingerprint=_confirm_fingerprint,
         )
 
         first_task = asyncio.create_task(first_client.run())
@@ -713,6 +864,38 @@ def _capture_registered_services(target: list[dict[str, object]]):
         target.extend(service for service in services if isinstance(service, dict))
 
     return capture
+
+
+def _confirm_fingerprint(fingerprint: str) -> bool:
+    return fingerprint.startswith("SHA256:")
+
+
+async def _open_tls_connection(
+    host: str,
+    port: int,
+    expected_fingerprint: str,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    reader, writer = await asyncio.open_connection(
+        host,
+        port,
+        ssl=create_client_tls_context(),
+    )
+    if not fingerprints_equal(peer_fingerprint(writer), expected_fingerprint):
+        await close_writer(writer)
+        raise AssertionError("test TLS fingerprint mismatch")
+    return reader, writer
+
+
+async def _read_tunnel_data(reader: asyncio.StreamReader) -> bytes:
+    header = await reader.readexactly(5)
+    if header[:1] != b"D":
+        raise AssertionError(f"expected tunnel data frame, got {header[:1]!r}")
+    return await reader.readexactly(struct.unpack("!I", header[1:])[0])
+
+
+async def _write_tunnel_data(writer: asyncio.StreamWriter, payload: bytes) -> None:
+    writer.write(b"D" + struct.pack("!I", len(payload)) + payload)
+    await writer.drain()
 
 
 async def _wait_for_assigned_address(services: list[dict[str, object]]) -> tuple[str, int]:

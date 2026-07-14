@@ -99,6 +99,8 @@ class CliTests(unittest.TestCase):
                 "example.com:7000",
                 "--token",
                 "secret",
+                "--server-fingerprint",
+                "SHA256:" + ":".join(["AA"] * 32),
                 "--local",
                 "192.168.1.50:8080",
             ]
@@ -106,6 +108,7 @@ class CliTests(unittest.TestCase):
 
         config = _load_client_command_config(args)
 
+        self.assertEqual(config.server_fingerprint, "SHA256:" + ":".join(["AA"] * 32))
         self.assertEqual(config.proxies[0].local_host, "192.168.1.50")
         self.assertEqual(config.proxies[0].local_port, 8080)
 

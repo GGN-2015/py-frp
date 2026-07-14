@@ -7,7 +7,14 @@ from collections.abc import Callable
 from typing import Any
 
 from .config import ClientConfig, ProxyConfig
-from .protocol import ProtocolError, close_writer, pipe_streams, read_message, write_message
+from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
+from .security import (
+    SecurityError,
+    create_client_tls_context,
+    fingerprints_equal,
+    normalize_fingerprint,
+    peer_fingerprint,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -22,12 +29,20 @@ class Client:
         self,
         config: ClientConfig,
         on_registered: Callable[[dict[str, Any]], None] | None = None,
+        confirm_fingerprint: Callable[[str], bool] | None = None,
     ):
         self.config = config
         self.on_registered = on_registered
+        self.confirm_fingerprint = confirm_fingerprint
         self._base_proxies = {proxy.name: proxy for proxy in config.proxies}
         self._proxies = dict(self._base_proxies)
         self._tasks: set[asyncio.Task[None]] = set()
+        self._tls_context = create_client_tls_context()
+        self._trusted_fingerprint = (
+            normalize_fingerprint(config.server_fingerprint)
+            if config.server_fingerprint is not None
+            else None
+        )
 
     async def run(self) -> None:
         while True:
@@ -36,6 +51,10 @@ class Client:
             except asyncio.CancelledError:
                 await self._cancel_tunnel_tasks()
                 raise
+            except SecurityError as exc:
+                LOGGER.error("TLS security error: %s", exc)
+                await self._cancel_tunnel_tasks()
+                return
             except FatalClientError as exc:
                 LOGGER.error("%s", exc)
                 await self._cancel_tunnel_tasks()
@@ -53,7 +72,7 @@ class Client:
         reader, writer = await self._open_server_connection()
         heartbeat_task: asyncio.Task[None] | None = None
         try:
-            await write_message(writer, {"type": "hello", "version": 1, "client": "py-frp"})
+            await write_message(writer, {"type": "hello", "version": 2, "client": "py-frp"})
             hello = await read_message(reader)
             if hello is None:
                 raise ProtocolError("server closed during hello")
@@ -94,10 +113,46 @@ class Client:
     async def _open_server_connection(
         self,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        return await asyncio.wait_for(
-            asyncio.open_connection(self.config.server_host, self.config.server_port),
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                self.config.server_host,
+                self.config.server_port,
+                ssl=self._tls_context,
+            ),
             timeout=self.config.connect_timeout,
         )
+        try:
+            await self._verify_server_fingerprint(writer)
+        except Exception:
+            await close_writer(writer)
+            raise
+        return reader, writer
+
+    async def _verify_server_fingerprint(self, writer: asyncio.StreamWriter) -> None:
+        fingerprint = peer_fingerprint(writer)
+        if self._trusted_fingerprint is not None:
+            if not fingerprints_equal(fingerprint, self._trusted_fingerprint):
+                raise SecurityError(
+                    "server TLS fingerprint changed or does not match the configured value"
+                )
+            return
+
+        if self.confirm_fingerprint is None:
+            print(f"server_tls_fingerprint {fingerprint}", flush=True)
+            try:
+                answer = await asyncio.to_thread(
+                    input,
+                    "Trust this server fingerprint? [y/N]: ",
+                )
+            except (EOFError, KeyboardInterrupt) as exc:
+                raise SecurityError("server fingerprint was not confirmed") from exc
+            confirmed = answer.strip().lower() in {"y", "yes"}
+        else:
+            confirmed = bool(self.confirm_fingerprint(fingerprint))
+
+        if not confirmed:
+            raise SecurityError("server fingerprint was rejected")
+        self._trusted_fingerprint = fingerprint
 
     async def _read_control_message(
         self,
@@ -190,7 +245,12 @@ class Client:
             )
             if local_reader is None or local_writer is None:
                 return
-            await pipe_streams(local_reader, local_writer, tunnel_reader, tunnel_writer)
+            await pipe_tunnel_streams(
+                local_reader,
+                local_writer,
+                tunnel_reader,
+                tunnel_writer,
+            )
         except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError) as exc:
             LOGGER.debug("tunnel %s for %s closed: %s", tunnel_id, service_name, exc)
         finally:

@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import ServerConfig, ServerServiceConfig
-from .protocol import ProtocolError, close_writer, pipe_streams, read_message, write_message
+from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
+from .security import ServerTLS, create_server_tls
 
 
 LOGGER = logging.getLogger(__name__)
@@ -73,15 +74,24 @@ class Server:
         self._pending: dict[str, PendingTunnel] = {}
         self._lock = asyncio.Lock()
         self._server: asyncio.AbstractServer | None = None
+        self._tls: ServerTLS | None = None
 
     async def start(self) -> None:
         if self._server is not None:
             return
-        self._server = await asyncio.start_server(
-            self._handle_connection,
-            self.config.bind_host,
-            self.config.bind_port,
-        )
+        self._tls = create_server_tls(self.config.bind_host)
+        try:
+            self._server = await asyncio.start_server(
+                self._handle_connection,
+                self.config.bind_host,
+                self.config.bind_port,
+                ssl=self._tls.context,
+            )
+        except Exception:
+            self._tls.close()
+            self._tls = None
+            raise
+        print(f"tls_fingerprint {self._tls.fingerprint}", flush=True)
         LOGGER.info("control listening on %s", _server_addresses(self._server))
 
     async def serve_forever(self) -> None:
@@ -95,6 +105,10 @@ class Server:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+
+        if self._tls is not None:
+            self._tls.close()
+            self._tls = None
 
         async with self._lock:
             services = list(self._services.values())
@@ -117,6 +131,12 @@ class Server:
         if self._server is None or self._server.sockets is None:
             return ()
         return tuple((str(sock.getsockname()[0]), int(sock.getsockname()[1])) for sock in self._server.sockets)
+
+    @property
+    def tls_fingerprint(self) -> str:
+        if self._tls is None:
+            raise RuntimeError("server has not been started")
+        return self._tls.fingerprint
 
     def service_address(self, name: str) -> tuple[str, int] | None:
         service = self._services.get(name)
@@ -164,7 +184,7 @@ class Server:
         try:
             current = first
             if current.get("type") == "hello":
-                await client.send({"type": "hello", "version": 1, "server": "py-frp"})
+                await client.send({"type": "hello", "version": 2, "server": "py-frp"})
                 current = await read_message(reader) or {}
             if current.get("type") != "register":
                 raise ProtocolError("control connection must register services")
@@ -423,7 +443,7 @@ class Server:
                 future,
                 timeout=self.config.open_timeout,
             )
-            await pipe_streams(reader, writer, tunnel_reader, tunnel_writer)
+            await pipe_tunnel_streams(reader, writer, tunnel_reader, tunnel_writer)
         except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError) as exc:
             LOGGER.debug("public connection for %s closed: %s", service_name, exc)
         except Exception:

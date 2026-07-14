@@ -64,6 +64,46 @@ server's `0.0.0.0:6000`. Connect from outside with:
 ssh -p 6000 user@your-server
 ```
 
+## Encrypted Server-to-Client Transport
+
+All control traffic and forwarded tunnel data between the py-frp server and
+client is encrypted with TLS 1.2 or newer. The server generates an ephemeral
+certificate at startup and prints its SHA-256 fingerprint to stdout:
+
+```text
+tls_fingerprint SHA256:12:34:...:AB
+```
+
+On its first connection, the client prints the fingerprint it received and
+asks for confirmation before sending a token or any tunnel data:
+
+```text
+server_tls_fingerprint SHA256:12:34:...:AB
+Trust this server fingerprint? [y/N]:
+```
+
+Compare it with the server's stdout through a trusted channel, then enter `y`.
+The confirmed fingerprint is pinned for every control and tunnel connection in
+that client process. A changed fingerprint is rejected. Because the certificate
+is ephemeral, restarting the server produces a new fingerprint and requires a
+new confirmation.
+
+For unattended clients, pin the value explicitly:
+
+```bash
+py-frp client --server your-server:7000 --token TOKEN_FROM_SERVER \
+  --server-fingerprint "SHA256:12:34:...:AB" --local 192.168.1.50:8080
+```
+
+Configuration files can set `serverFingerprint` (frp TOML),
+`server_fingerprint` in `[common]` (frp INI), or `server_fingerprint` in
+`[client]` (rathole TOML). Omitting it enables interactive confirmation.
+
+This protects the server-to-client segment. The public user's connection to the
+server port and the client's connection to its local/LAN target are separate
+segments; use an encrypted application protocol such as HTTPS or SSH there when
+end-to-end encryption is required.
+
 ## Configless Port Pool Mode
 
 The server can run without a config file by specifying a control port and a
@@ -212,6 +252,8 @@ most once.
 Supported:
 
 - TCP reverse port forwarding
+- TLS 1.2+ encryption for all server-to-client control and tunnel traffic
+- Interactive SHA-256 server fingerprint verification and optional pinning
 - Multiple services/proxies
 - Token authentication
 - Configless shared-token port pool mode
@@ -225,7 +267,7 @@ Not currently supported:
 - UDP
 - HTTP/HTTPS virtual hosts
 - frp plugins, load balancing, STCP, or XTCP
-- rathole Noise/TLS encrypted transport
+- rathole Noise/TLS wire-protocol compatibility
 - Multiplexing; each public connection opens one independent tunnel TCP
 
 ## Tests

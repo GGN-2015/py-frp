@@ -29,6 +29,7 @@ class ConfigTests(unittest.TestCase):
                     """
                     serverAddr = "example.com"
                     serverPort = 7000
+                    serverFingerprint = "SHA256:AA:BB"
                     auth.token = "secret"
 
                     [[proxies]]
@@ -49,6 +50,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(server.token, "secret")
             self.assertTrue(server.allow_dynamic)
             self.assertEqual(client.server_host, "example.com")
+            self.assertEqual(client.server_fingerprint, "SHA256:AA:BB")
             self.assertEqual(client.proxies[0].remote_port, 6000)
 
     def test_frp_toml_preserves_lan_target_address(self) -> None:
