@@ -103,7 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     client.add_argument(
         "--local",
         default="127.0.0.1:22",
-        help="local target for configless mode; defaults to 127.0.0.1:22",
+        help=(
+            "target host and port reachable from this client (including a LAN host); "
+            "defaults to 127.0.0.1:22"
+        ),
     )
     client.add_argument("--reconnect-delay", type=float, default=3.0, help="client reconnect delay")
     client.add_argument("--connect-timeout", type=float, default=10.0, help="connection timeout")

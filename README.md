@@ -104,6 +104,19 @@ If the local target is not SSH, set it explicitly:
 py-frp client --server your-server:7000 --token TOKEN_FROM_SERVER --local 127.0.0.1:8080
 ```
 
+The target does not have to run on the client itself. Any TCP address reachable
+from the client can be forwarded, including another device on the client's LAN.
+For example, this exposes `192.168.1.50:8080` through the assigned public port:
+
+```bash
+py-frp client --server your-server:7000 --token TOKEN_FROM_SERVER --local 192.168.1.50:8080
+```
+
+The same applies to config files. Set `localIP` (frp), `local_ip` (legacy frp
+INI), or the host part of `local_addr` (rathole) to the LAN device address. The
+client machine must be able to connect to that address, and the target device's
+firewall must allow the connection from the client machine.
+
 Multiple clients can use the same shared token at the same time. Each client is
 assigned one currently unused port from the pool, using the lowest available
 port first. If the pool is exhausted, the server rejects the new client and the
@@ -137,6 +150,9 @@ localIP = "127.0.0.1"
 localPort = 22
 remotePort = 6000
 ```
+
+To forward a service on another LAN device, use (for example)
+`localIP = "192.168.1.50"` with that device's service port.
 
 Legacy frp INI `[common]` and TCP proxy sections are also supported:
 

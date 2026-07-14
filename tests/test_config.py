@@ -51,6 +51,31 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(client.server_host, "example.com")
             self.assertEqual(client.proxies[0].remote_port, 6000)
 
+    def test_frp_toml_preserves_lan_target_address(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frpc.toml"
+            path.write_text(
+                textwrap.dedent(
+                    """
+                    serverAddr = "example.com"
+                    serverPort = 7000
+
+                    [[proxies]]
+                    name = "nas"
+                    type = "tcp"
+                    localIP = "192.168.1.50"
+                    localPort = 8080
+                    remotePort = 6000
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            client = load_client_config(path)
+
+            self.assertEqual(client.proxies[0].local_host, "192.168.1.50")
+            self.assertEqual(client.proxies[0].local_port, 8080)
+
     def test_load_rathole_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

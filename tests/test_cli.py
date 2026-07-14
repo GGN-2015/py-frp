@@ -90,6 +90,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.proxies[0].name, token_service_name("secret"))
         self.assertEqual(config.proxies[0].local_port, 8080)
 
+    def test_configless_client_accepts_lan_target(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "client",
+                "--server",
+                "example.com:7000",
+                "--token",
+                "secret",
+                "--local",
+                "192.168.1.50:8080",
+            ]
+        )
+
+        config = _load_client_command_config(args)
+
+        self.assertEqual(config.proxies[0].local_host, "192.168.1.50")
+        self.assertEqual(config.proxies[0].local_port, 8080)
+
 
 if __name__ == "__main__":
     unittest.main()

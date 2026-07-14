@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
+import socket
 import unittest
 
 from py_frp.client import Client
@@ -71,6 +73,71 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             writer.write(b"hello")
             await writer.drain()
             self.assertEqual(await reader.read(5), b"HELLO")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            client_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await client_task
+            await tunnel_server.close()
+            echo_server.close()
+            await echo_server.wait_closed()
+
+    async def test_tcp_reverse_tunnel_to_lan_address(self) -> None:
+        lan_host = _non_loopback_ipv4()
+        if lan_host is None:
+            self.skipTest("no non-loopback IPv4 address is available")
+
+        async def echo(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            data = await reader.read(1024)
+            writer.write(b"lan:" + data)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        try:
+            echo_server = await asyncio.start_server(echo, lan_host, 0)
+        except OSError as exc:
+            self.skipTest(f"cannot bind test service to LAN address {lan_host}: {exc}")
+        echo_port = int(echo_server.sockets[0].getsockname()[1])
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                token="secret",
+                allow_dynamic=True,
+            )
+        )
+        await tunnel_server.start()
+        control_port = tunnel_server.control_addresses()[0][1]
+        client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=control_port,
+                token="secret",
+                reconnect_delay=0.1,
+                proxies=(
+                    ProxyConfig(
+                        name="lan-echo",
+                        local_host=lan_host,
+                        local_port=echo_port,
+                        remote_host="127.0.0.1",
+                        remote_port=0,
+                        token="secret",
+                    ),
+                ),
+            )
+        )
+        client_task = asyncio.create_task(client.run())
+        try:
+            public_addr = await _wait_for_service(tunnel_server, "lan-echo")
+            reader, writer = await asyncio.open_connection(*public_addr)
+            writer.write(b"hello")
+            await writer.drain()
+            self.assertEqual(await reader.read(9), b"lan:hello")
             writer.close()
             await writer.wait_closed()
         finally:
@@ -664,6 +731,31 @@ async def _unused_tcp_port() -> int:
     finally:
         server.close()
         await server.wait_closed()
+
+
+def _non_loopback_ipv4() -> str | None:
+    candidates: set[str] = set()
+    try:
+        candidates.update(
+            address[4][0]
+            for address in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        )
+    except socket.gaierror:
+        pass
+
+    # A UDP connect selects the interface route without sending any packets.
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as probe:
+        try:
+            probe.connect(("192.0.2.1", 9))
+            candidates.add(str(probe.getsockname()[0]))
+        except OSError:
+            pass
+
+    for candidate in sorted(candidates):
+        address = ipaddress.ip_address(candidate)
+        if not address.is_loopback and not address.is_unspecified and not address.is_link_local:
+            return candidate
+    return None
 
 
 if __name__ == "__main__":
