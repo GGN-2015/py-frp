@@ -7,6 +7,7 @@ import socket
 import unittest
 
 from py_frp.client import Client
+from py_frp.cli import _load_client_command_config, build_parser
 from py_frp.config import ClientConfig, ProxyConfig, ServerConfig, ServerServiceConfig
 from py_frp.pool import token_service_name
 from py_frp.protocol import close_writer, read_message, write_message
@@ -83,7 +84,7 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             echo_server.close()
             await echo_server.wait_closed()
 
-    async def test_tcp_reverse_tunnel_to_lan_address(self) -> None:
+    async def test_configless_client_tunnels_to_lan_address(self) -> None:
         lan_host = _non_loopback_ipv4()
         if lan_host is None:
             self.skipTest("no non-loopback IPv4 address is available")
@@ -103,37 +104,43 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         except OSError as exc:
             self.skipTest(f"cannot bind test service to LAN address {lan_host}: {exc}")
         echo_port = int(echo_server.sockets[0].getsockname()[1])
+        token = "lan-secret"
         tunnel_server = Server(
             ServerConfig(
                 bind_host="127.0.0.1",
                 bind_port=0,
-                token="secret",
-                allow_dynamic=True,
+                allow_dynamic=False,
+                port_pool=(0,),
+                pool_tokens=(token,),
+                pool_bind_host="127.0.0.1",
             )
         )
         await tunnel_server.start()
         control_port = tunnel_server.control_addresses()[0][1]
+        args = build_parser().parse_args(
+            [
+                "client",
+                "--server",
+                f"127.0.0.1:{control_port}",
+                "--token",
+                token,
+                "--local",
+                f"{lan_host}:{echo_port}",
+                "--reconnect-delay",
+                "0.1",
+            ]
+        )
+        client_config = _load_client_command_config(args)
+        self.assertEqual(client_config.source_flavor, "token-pool")
+        self.assertEqual(client_config.proxies[0].local_host, lan_host)
+        assigned: list[dict[str, object]] = []
         client = Client(
-            ClientConfig(
-                server_host="127.0.0.1",
-                server_port=control_port,
-                token="secret",
-                reconnect_delay=0.1,
-                proxies=(
-                    ProxyConfig(
-                        name="lan-echo",
-                        local_host=lan_host,
-                        local_port=echo_port,
-                        remote_host="127.0.0.1",
-                        remote_port=0,
-                        token="secret",
-                    ),
-                ),
-            )
+            client_config,
+            on_registered=_capture_registered_services(assigned),
         )
         client_task = asyncio.create_task(client.run())
         try:
-            public_addr = await _wait_for_service(tunnel_server, "lan-echo")
+            public_addr = await _wait_for_assigned_address(assigned)
             reader, writer = await asyncio.open_connection(*public_addr)
             writer.write(b"hello")
             await writer.drain()
