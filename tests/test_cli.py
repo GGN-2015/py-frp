@@ -5,6 +5,7 @@ import io
 import unittest
 
 from py_frp.cli import build_parser, _load_client_command_config, _load_server_command_config, _print_token_pool
+from py_frp.config import ConfigError
 from py_frp.pool import TOKEN_ALPHABET, token_service_name
 
 
@@ -111,6 +112,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.server_fingerprint, "SHA256:" + ":".join(["AA"] * 32))
         self.assertEqual(config.proxies[0].local_host, "192.168.1.50")
         self.assertEqual(config.proxies[0].local_port, 8080)
+
+    def test_configless_client_accepts_force_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "client",
+                "--server",
+                "example.com:7000",
+                "--token",
+                "secret",
+                "--force",
+            ]
+        )
+
+        self.assertTrue(args.force)
+        self.assertEqual(_load_client_command_config(args).source_flavor, "token-pool")
+
+    def test_force_flag_is_rejected_with_config_file(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["client", "--config", "frpc.toml", "--force"])
+
+        with self.assertRaisesRegex(ConfigError, "configless client mode"):
+            _load_client_command_config(args)
 
 
 if __name__ == "__main__":

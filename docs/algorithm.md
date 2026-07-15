@@ -68,7 +68,8 @@ After registration, the client sends `ping` messages at the configured
 heartbeat interval and the server responds with `pong`. Loss of the control
 connection removes all of that client's public listeners and pending tunnels.
 Recoverable failures cause the client to wait `reconnect_delay` and register
-again. Fatal authentication or resource-exhaustion responses stop the client.
+again. Fatal authentication or unforceable resource-exhaustion responses stop
+the client.
 
 ## Port-pool allocation
 
@@ -93,8 +94,26 @@ Allocation runs under the server state lock:
 
 This makes allocation deterministic while allowing multiple simultaneous
 clients to share one token. When the client disconnects, its listener closes and
-the port returns to the pool. If no bind succeeds, only the new registration is
-rejected with a fatal resource-insufficient error.
+the port returns to the pool.
+
+If allocation fails because all usable ports belong to online pool clients, a
+normal registration receives a `force_required` response. The client may close
+the connection to decline or retry the same registration with `force: true`.
+An initially forced registration, such as one produced by `--force`, skips the
+question. Under the state lock, the server then:
+
+1. Selects the earliest registered pool service.
+2. Removes every service and pending tunnel owned by that client.
+3. Closes its public listener and binds the newly freed port for the requester.
+4. Sends a non-fatal `preempted` error and closes the victim's control channel.
+
+Closing the victim's control channel activates the ordinary client reconnect
+loop. A reconnect performs a fresh registration, so it can receive another
+`force_required` response; the interactive decision or persistent `--force`
+policy is applied each time. Allocation and victim selection are serialized by
+the server state lock. Ports occupied by unrelated operating-system processes
+do not create a force option because disconnecting a py-frp client cannot free
+them.
 
 ## Opening a tunnel
 

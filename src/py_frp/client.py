@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .config import ClientConfig, ProxyConfig
+from .config import ClientConfig
 from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
 from .security import (
     SecurityError,
@@ -30,10 +30,14 @@ class Client:
         config: ClientConfig,
         on_registered: Callable[[dict[str, Any]], None] | None = None,
         confirm_fingerprint: Callable[[str], bool] | None = None,
+        confirm_force: Callable[[str], bool] | None = None,
+        force_connect: bool = False,
     ):
         self.config = config
         self.on_registered = on_registered
         self.confirm_fingerprint = confirm_fingerprint
+        self.confirm_force = confirm_force
+        self.force_connect = force_connect
         self._base_proxies = {proxy.name: proxy for proxy in config.proxies}
         self._proxies = dict(self._base_proxies)
         self._tasks: set[asyncio.Task[None]] = set()
@@ -78,10 +82,28 @@ class Client:
                 raise ProtocolError("server closed during hello")
             _raise_error_response(hello)
 
-            await write_message(writer, {"type": "register", "services": self._service_payloads()})
+            register_message: dict[str, Any] = {
+                "type": "register",
+                "services": self._service_payloads(),
+            }
+            if self.force_connect:
+                register_message["force"] = True
+            await write_message(writer, register_message)
             registered = await read_message(reader)
             if registered is None:
                 raise ProtocolError("server closed during register")
+            if registered.get("type") == "force_required":
+                question = _message_error(
+                    registered,
+                    "the server port pool is full",
+                )
+                if not self.force_connect and not await self._confirm_force_connection(question):
+                    raise FatalClientError("force connection declined; client stopped")
+                register_message["force"] = True
+                await write_message(writer, register_message)
+                registered = await read_message(reader)
+                if registered is None:
+                    raise ProtocolError("server closed during forced register")
             _raise_error_response(registered)
             if registered.get("type") != "registered" or registered.get("status") != "ok":
                 raise ProtocolError(f"unexpected register response: {registered!r}")
@@ -182,6 +204,19 @@ class Client:
         while True:
             await asyncio.sleep(self.config.heartbeat_interval)
             await write_message(writer, {"type": "ping", "time": time.time()})
+
+    async def _confirm_force_connection(self, reason: str) -> bool:
+        if self.confirm_force is not None:
+            return bool(self.confirm_force(reason))
+        print(reason, flush=True)
+        try:
+            answer = await asyncio.to_thread(
+                input,
+                "Force connection and disconnect the oldest pool client? [y/N]: ",
+            )
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer.strip().lower() in {"y", "yes"}
 
     def _service_payloads(self) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []

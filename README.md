@@ -35,5 +35,6 @@ Replace `127.0.0.1`, the ports, and `change-me` in the example files before
 using them outside a local test.
 
 For every command, option, and supported configuration format, see the
-[CLI manual](docs/cli.md). For the tunnel lifecycle, protocol, port allocation,
-and security design, see the [algorithm manual](docs/algorithm.md).
+[CLI manual](https://github.com/GGN-2015/py-frp/blob/main/docs/cli.md). For the
+tunnel lifecycle, protocol, port allocation, and security design, see the
+[algorithm manual](https://github.com/GGN-2015/py-frp/blob/main/docs/algorithm.md).

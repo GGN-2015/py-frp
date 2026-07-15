@@ -24,6 +24,10 @@ class ResourceExhaustedError(ProtocolError):
     """Raised when no pool port can be assigned to a client."""
 
 
+class ForceRequiredError(ResourceExhaustedError):
+    """Raised when a pool client may take a port by evicting another client."""
+
+
 @dataclass
 class ClientSession:
     id: str
@@ -189,7 +193,33 @@ class Server:
             if current.get("type") != "register":
                 raise ProtocolError("control connection must register services")
 
-            registered = await self._register_client(client, current.get("services"))
+            try:
+                registered = await self._register_client(
+                    client,
+                    current.get("services"),
+                    force=current.get("force") is True,
+                )
+            except ForceRequiredError as exc:
+                await client.send(
+                    {
+                        "type": "force_required",
+                        "status": "full",
+                        "error": str(exc),
+                    }
+                )
+                retry = await read_message(reader)
+                if retry is None:
+                    return
+                current = retry
+                if current.get("type") == "close":
+                    return
+                if current.get("type") != "register" or current.get("force") is not True:
+                    raise ProtocolError("force retry must register services with force enabled")
+                registered = await self._register_client(
+                    client,
+                    current.get("services"),
+                    force=True,
+                )
             await client.send(
                 {
                     "type": "registered",
@@ -236,6 +266,8 @@ class Server:
         self,
         client: ClientSession,
         raw_services: Any,
+        *,
+        force: bool = False,
     ) -> list[RegisteredService]:
         if not isinstance(raw_services, list) or not raw_services:
             raise ProtocolError("register message must include services")
@@ -244,7 +276,11 @@ class Server:
         try:
             for raw in raw_services:
                 if self._is_pool_registration(raw):
-                    registered_service = await self._register_pool_service(client, raw)
+                    registered_service = await self._register_pool_service(
+                        client,
+                        raw,
+                        force=force,
+                    )
                 else:
                     registered_service = await self._register_regular_service(client, raw)
                 registered.append(registered_service)
@@ -291,6 +327,8 @@ class Server:
         self,
         client: ClientSession,
         raw: Any,
+        *,
+        force: bool = False,
     ) -> RegisteredService:
         if not isinstance(raw, dict):
             raise ProtocolError("service registration must be an object")
@@ -299,46 +337,129 @@ class Server:
             raise AuthenticationError("authentication failed")
 
         service_name = _pool_service_name(client)
+        victim: ClientSession | None = None
+        victim_services: list[RegisteredService] = []
+        victim_pending: list[PendingTunnel] = []
+        registered_service: RegisteredService | None = None
         last_error: OSError | None = None
 
         async with self._lock:
-            used_ports = {
-                service.bind_port
-                for service in self._services.values()
-                if service.pool_token is not None
-            }
-            for port in sorted(self.config.port_pool):
-                if port in used_ports:
-                    continue
-                try:
-                    listener = await asyncio.start_server(
-                        lambda reader, writer, name=service_name: self._handle_public(name, reader, writer),
-                        self.config.pool_bind_host,
-                        port,
-                    )
-                except OSError as exc:
-                    last_error = exc
-                    LOGGER.warning("pool port %d is unavailable: %s", port, exc)
-                    continue
-
-                registered_service = RegisteredService(
-                    name=service_name,
-                    bind_host=self.config.pool_bind_host,
-                    bind_port=port,
-                    token=token,
-                    client=client,
-                    listener=listener,
-                    configured=True,
-                    pool_token=token,
-                )
-                self._services[service_name] = registered_service
+            registered_service, last_error = await self._bind_pool_service_locked(
+                client,
+                service_name,
+                token,
+            )
+            if registered_service is not None:
                 return registered_service
 
-        if last_error is not None:
-            raise ResourceExhaustedError(
-                "resource insufficient: no available port in the configured pool"
-            ) from last_error
-        raise ResourceExhaustedError("resource insufficient: no available port in the configured pool")
+            oldest_pool_service = next(
+                (
+                    service
+                    for service in self._services.values()
+                    if service.pool_token is not None and service.client is not client
+                ),
+                None,
+            )
+            if oldest_pool_service is None:
+                raise _resource_exhausted(last_error)
+            if not force:
+                raise ForceRequiredError(
+                    "resource insufficient: the port pool is full; force connection can "
+                    "disconnect the oldest pool client"
+                )
+
+            victim = oldest_pool_service.client
+            victim_services = [
+                service for service in self._services.values() if service.client is victim
+            ]
+            for service in victim_services:
+                self._services.pop(service.name, None)
+                service.listener.close()
+            victim_pending = [
+                item for item in self._pending.values() if item.client is victim
+            ]
+            for item in victim_pending:
+                self._pending.pop(item.id, None)
+            await asyncio.gather(
+                *(service.listener.wait_closed() for service in victim_services),
+                return_exceptions=True,
+            )
+
+            registered_service, last_error = await self._bind_pool_service_locked(
+                client,
+                service_name,
+                token,
+            )
+
+        for item in victim_pending:
+            if not item.future.done():
+                item.future.set_exception(ConnectionError("client was preempted"))
+        assert victim is not None
+        try:
+            await victim.send(
+                {
+                    "type": "error",
+                    "error": "connection preempted by a forced pool connection",
+                    "code": "preempted",
+                    "fatal": False,
+                }
+            )
+        except (ConnectionError, OSError, ProtocolError):
+            pass
+        await close_writer(victim.writer)
+        LOGGER.warning(
+            "client %s was preempted by forced client %s",
+            victim.id,
+            client.id,
+        )
+
+        if registered_service is None:
+            raise _resource_exhausted(last_error)
+        return registered_service
+
+    async def _bind_pool_service_locked(
+        self,
+        client: ClientSession,
+        service_name: str,
+        token: str,
+    ) -> tuple[RegisteredService | None, OSError | None]:
+        used_ports = {
+            service.bind_port
+            for service in self._services.values()
+            if service.pool_token is not None
+        }
+        last_error: OSError | None = None
+        for port in sorted(self.config.port_pool):
+            if port in used_ports:
+                continue
+            try:
+                listener = await asyncio.start_server(
+                    lambda reader, writer, name=service_name: self._handle_public(
+                        name,
+                        reader,
+                        writer,
+                    ),
+                    self.config.pool_bind_host,
+                    port,
+                )
+            except OSError as exc:
+                last_error = exc
+                LOGGER.warning("pool port %d is unavailable: %s", port, exc)
+                continue
+
+            registered_service = RegisteredService(
+                name=service_name,
+                bind_host=self.config.pool_bind_host,
+                bind_port=port,
+                token=token,
+                client=client,
+                listener=listener,
+                configured=True,
+                pool_token=token,
+            )
+            self._services[service_name] = registered_service
+            return registered_service, last_error
+        return None, last_error
 
     def _is_pool_registration(self, raw: Any) -> bool:
         if not self.config.port_pool:
@@ -526,3 +647,12 @@ def _server_addresses(server: asyncio.AbstractServer) -> str:
 
 def _pool_service_name(client: ClientSession) -> str:
     return f"pool-{client.id}"
+
+
+def _resource_exhausted(cause: OSError | None) -> ResourceExhaustedError:
+    error = ResourceExhaustedError(
+        "resource insufficient: no available port in the configured pool"
+    )
+    if cause is not None:
+        error.__cause__ = cause
+    return error

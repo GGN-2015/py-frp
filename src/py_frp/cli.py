@@ -101,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     client.add_argument("--server", help="server control address for configless mode, e.g. example.com:7000")
     client.add_argument("--token", help="token for configless mode")
     client.add_argument(
+        "--force",
+        action="store_true",
+        help="automatically force a connection when the configless server port pool is full",
+    )
+    client.add_argument(
         "--server-fingerprint",
         help="trusted SHA-256 TLS fingerprint; omit to confirm interactively",
     )
@@ -144,7 +149,13 @@ def _run_client_command(args: argparse.Namespace) -> int:
     config = _load_client_command_config(args)
     LOGGER.info("loaded client config: %s", describe_client_config(config))
     callback = _print_assigned_ports if config.source_flavor == "token-pool" else None
-    asyncio.run(Client(config, on_registered=callback).run())
+    asyncio.run(
+        Client(
+            config,
+            on_registered=callback,
+            force_connect=args.force,
+        ).run()
+    )
     return 0
 
 
@@ -169,6 +180,8 @@ def _load_server_command_config(args: argparse.Namespace) -> ServerConfig:
 
 def _load_client_command_config(args: argparse.Namespace) -> ClientConfig:
     if args.config:
+        if args.force:
+            raise ConfigError("--force is only available in configless client mode")
         return load_client_config(args.config)
     if not args.server or not args.token:
         raise ConfigError("client requires --config or both --server and --token")
