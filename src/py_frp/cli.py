@@ -116,7 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     client.add_argument(
         "--server-fingerprint",
-        help="trusted SHA-256 TLS fingerprint; omit to confirm interactively",
+        help=(
+            "trusted SHA-256 TLS fingerprint; '...' matches whole bytes; "
+            "omit to confirm interactively"
+        ),
     )
     client.add_argument(
         "--local",

@@ -29,6 +29,30 @@ class SecurityTests(unittest.TestCase):
         with self.assertRaisesRegex(SecurityError, "exactly 32"):
             normalize_fingerprint("SHA256:AA:BB")
 
+    def test_ellipsis_matches_whole_sha256_byte_sequences(self) -> None:
+        actual = "SHA256:" + ":".join(
+            ["12", "34", *("56" for _ in range(29)), "AB"]
+        )
+        pattern = "sha256:12:34:...:ab"
+
+        self.assertEqual(normalize_fingerprint(pattern), "SHA256:12:34:...:AB")
+        self.assertTrue(fingerprints_equal(actual, pattern))
+        self.assertTrue(fingerprints_equal(pattern, actual))
+        self.assertFalse(fingerprints_equal(actual, "SHA256:12:35:...:AB"))
+        self.assertFalse(fingerprints_equal(actual, "SHA256:12:34:...:AC"))
+
+    def test_rejects_unsafe_or_malformed_fingerprint_wildcards(self) -> None:
+        invalid_patterns = (
+            "SHA256:...",
+            "SHA256:AA:...:BB:...:CC",
+            "SHA256:A:...:BB",
+            "SHA256:GG:...:BB",
+            "SHA256:" + ":".join(["AA"] * 33) + ":...",
+        )
+        for pattern in invalid_patterns:
+            with self.subTest(pattern=pattern), self.assertRaises(SecurityError):
+                normalize_fingerprint(pattern)
+
     def test_server_tls_fingerprint_survives_restart_state_round_trip(self) -> None:
         with mock.patch.dict(
             os.environ,

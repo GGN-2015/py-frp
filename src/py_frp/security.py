@@ -153,24 +153,90 @@ def peer_fingerprint(writer: object) -> str:
 
 
 def normalize_fingerprint(value: str) -> str:
-    text = value.strip().upper()
-    if text.startswith("SHA256:"):
-        text = text[7:]
-    hex_value = re.sub(r"[^0-9A-F]", "", text)
-    if len(hex_value) != 64:
-        raise SecurityError("server fingerprint must contain exactly 32 SHA-256 bytes")
-    return "SHA256:" + ":".join(
-        hex_value[index : index + 2] for index in range(0, len(hex_value), 2)
-    )
+    prefix, suffix, wildcard = _parse_fingerprint(value)
+    parts = [f"{byte:02X}" for byte in prefix]
+    if wildcard:
+        parts.append("...")
+        parts.extend(f"{byte:02X}" for byte in suffix)
+    return "SHA256:" + ":".join(parts)
 
 
 def fingerprints_equal(left: str, right: str) -> bool:
     try:
-        normalized_left = normalize_fingerprint(left)
-        normalized_right = normalize_fingerprint(right)
+        left_prefix, left_suffix, left_wildcard = _parse_fingerprint(left)
+        right_prefix, right_suffix, right_wildcard = _parse_fingerprint(right)
     except SecurityError:
         return False
-    return hmac.compare_digest(normalized_left, normalized_right)
+    if left_wildcard and right_wildcard:
+        return hmac.compare_digest(
+            normalize_fingerprint(left),
+            normalize_fingerprint(right),
+        )
+    if left_wildcard:
+        return _wildcard_fingerprint_matches(
+            right_prefix,
+            left_prefix,
+            left_suffix,
+        )
+    if right_wildcard:
+        return _wildcard_fingerprint_matches(
+            left_prefix,
+            right_prefix,
+            right_suffix,
+        )
+    return hmac.compare_digest(left_prefix, right_prefix)
+
+
+def _parse_fingerprint(value: str) -> tuple[bytes, bytes, bool]:
+    text = value.strip().upper()
+    if text.startswith("SHA256:"):
+        text = text[7:]
+    wildcard_count = text.count("...")
+    if wildcard_count > 1:
+        raise SecurityError("server fingerprint may contain at most one '...' wildcard")
+    if wildcard_count == 0:
+        digest = _parse_fingerprint_bytes(text)
+        if len(digest) != 32:
+            raise SecurityError(
+                "server fingerprint must contain exactly 32 SHA-256 bytes"
+            )
+        return digest, b"", False
+
+    raw_prefix, raw_suffix = text.split("...", 1)
+    prefix = _parse_fingerprint_bytes(raw_prefix)
+    suffix = _parse_fingerprint_bytes(raw_suffix)
+    if not prefix and not suffix:
+        raise SecurityError(
+            "server fingerprint wildcard must include at least one fixed byte"
+        )
+    if len(prefix) + len(suffix) > 32:
+        raise SecurityError(
+            "server fingerprint wildcard contains more than 32 fixed bytes"
+        )
+    return prefix, suffix, True
+
+
+def _parse_fingerprint_bytes(value: str) -> bytes:
+    if re.search(r"[^0-9A-F:\-\s]", value):
+        raise SecurityError("server fingerprint contains invalid characters")
+    hex_value = re.sub(r"[:\-\s]", "", value)
+    if len(hex_value) % 2:
+        raise SecurityError("server fingerprint bytes must use two hexadecimal digits")
+    return bytes.fromhex(hex_value)
+
+
+def _wildcard_fingerprint_matches(
+    actual: bytes,
+    prefix: bytes,
+    suffix: bytes,
+) -> bool:
+    if len(actual) != 32 or len(prefix) + len(suffix) > len(actual):
+        return False
+    actual_suffix = actual[len(actual) - len(suffix) :] if suffix else b""
+    return hmac.compare_digest(actual[: len(prefix)], prefix) & hmac.compare_digest(
+        actual_suffix,
+        suffix,
+    )
 
 
 def format_fingerprint(digest: bytes) -> str:

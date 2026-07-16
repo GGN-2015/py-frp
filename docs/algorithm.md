@@ -35,9 +35,13 @@ public TCP connection creates a separate TLS tunnel connection.
 4. Once confirmed, the client stores the normalized fingerprint in memory and
    requires every control and data connection in that process to match it.
 
-Fingerprint comparisons normalize case and separators, then use a
-constant-time comparison. A different certificate aborts the connection before
-authentication data or tunnel traffic is sent.
+Complete fingerprint comparisons normalize case and separators, then compare
+all 32 bytes in constant time. A configured fingerprint may instead contain one
+literal `...`, which matches zero or more complete bytes between an anchored
+prefix and suffix. At least one byte must remain fixed. Fixed portions are also
+compared in constant time; using fewer fixed bytes deliberately weakens the pin.
+A nonmatching certificate aborts the connection before authentication data or
+tunnel traffic is sent.
 
 ## Installed-package update monitor
 

@@ -91,6 +91,30 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(SecurityError, "fingerprint changed"):
                 await wrong_client._open_server_connection()
 
+            fingerprint_bytes = tunnel_server.tls_fingerprint.removeprefix(
+                "SHA256:"
+            ).split(":")
+            wildcard_client = Client(
+                ClientConfig(
+                    server_host="127.0.0.1",
+                    server_port=control_port,
+                    token="secret",
+                    server_fingerprint=(
+                        f"SHA256:{fingerprint_bytes[0]}:{fingerprint_bytes[1]}:"
+                        f"...:{fingerprint_bytes[-1]}"
+                    ),
+                    proxies=(
+                        ProxyConfig(
+                            name="unused",
+                            local_host="127.0.0.1",
+                            local_port=1,
+                        ),
+                    ),
+                )
+            )
+            _, wildcard_writer = await wildcard_client._open_server_connection()
+            await close_writer(wildcard_writer)
+
             rejected_client = Client(
                 ClientConfig(
                     server_host="127.0.0.1",
