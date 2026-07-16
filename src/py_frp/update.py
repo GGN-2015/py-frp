@@ -13,6 +13,7 @@ from packaging.version import InvalidVersion, Version
 
 from . import __version__
 from .restart import RESTART_TARGET_VERSION_ENV
+from .supervisor_ipc import is_supervised_child, supervisor_restart_target
 
 
 LOGGER = logging.getLogger(__name__)
@@ -65,12 +66,13 @@ async def wait_for_version_change(
     if interval <= 0:
         raise ValueError("update check interval must be greater than zero")
     baseline = initial_version or __version__
-    suppressed_target = _failed_restart_target(baseline)
+    supervised = is_supervised_child()
+    suppressed_target = None if supervised else _failed_restart_target(baseline)
     while True:
         await asyncio.sleep(interval)
-        current = version_reader()
+        current = supervisor_restart_target() if supervised else version_reader()
         if current is None:
-            LOGGER.debug("installed package version is temporarily unavailable")
+            LOGGER.debug("no package restart target is currently available")
             continue
         if current != baseline:
             if current == suppressed_target:
@@ -103,7 +105,7 @@ async def run_until_version_change(
         if update_task in done:
             change = update_task.result()
             LOGGER.info(
-                "installed package changed from %s to %s; restarting",
+                "package restart requested from %s to %s",
                 change.previous,
                 change.current,
             )

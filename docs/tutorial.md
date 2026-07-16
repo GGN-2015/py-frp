@@ -156,8 +156,9 @@ cycle of clients continuously evicting one another.
 
 ## 6. Understand the default update behavior
 
-Both server and client enable automatic restart by default. Every five seconds
-they compare:
+Both server and client enable automatic restart by default. From the first
+launch, the terminal is owned by a small supervisor and the tunnel runs in its
+single business child. Every five seconds the supervisor compares:
 
 - the package version loaded in the running process; and
 - the version in the locally installed distribution metadata.
@@ -204,14 +205,16 @@ The following handoff then happens automatically:
 3. It sends connected clients `server_restarting` with a three-second minimum
    retry suggestion.
 4. It closes every public and control listener and all pending tunnels.
-5. Immediately after cleanup, it starts the same command with the same Python,
-   arguments, working directory, environment, and terminal.
+5. The child returns its compatibility state and exits to the supervisor.
+6. Immediately after reaping it, the same supervisor starts a new business
+   child with the same Python, arguments, working directory, environment, and
+   terminal.
 
-There is no deliberate service gap after cleanup. Linux and macOS replace the
-process with POSIX `exec`. On Windows, the first update creates one foreground
-supervisor in the same terminal. Every later update asks that same supervisor
-to reap and replace its single child, so repeated legitimate upgrades do not
-build a chain of wrapper processes.
+There is no deliberate delay after cleanup. Linux, macOS, and Windows all use
+the same persistent-supervisor design. The terminal-owning process never exits
+during replacement, so the shell prompt does not appear between the old and new
+child's output. Only one business child exists at a time, and repeated upgrades
+do not build a chain of wrapper processes.
 
 The replacement server prints the same token and the same SHA-256 fingerprint.
 Clients that received the restart notice wait
@@ -226,11 +229,13 @@ This is the important validation checklist after an upgrade:
 - the printed TLS fingerprint is unchanged;
 - clients reconnect after their backoff and receive service ports again.
 
-If the replacement does not load the version that triggered restart, it logs a
-target-version mismatch and keeps serving without retrying that same handoff.
-Correct the installation shown by `py_frp.__file__`; a different installed
-version then permits one new restart attempt. This circuit breaker prevents an
-incorrect install location from causing an infinite restart loop.
+If replacements do not load the version that triggered restart, each mismatch
+is counted by the supervisor. Three failures toward that target inside 30
+seconds suppress further requests for that exact version; the final stable
+child continues serving. Correct the installation shown by `py_frp.__file__`.
+When installed metadata changes to a different version, suppression clears and
+one new bounded three-attempt cycle becomes available. This circuit breaker
+prevents an incorrect install location from causing an infinite restart loop.
 
 ## 8. Upgrade a running client
 
@@ -258,8 +263,9 @@ that decision; an unconfirmed certificate is never silently trusted.
 - Monitor stderr logs and the stdout values that automation depends on.
 - Verify both `py_frp.__version__` and `py_frp.__file__` before an upgrade when
   the host has ever used both user and system package installs.
-- Expect Ctrl+C to return 130. On Windows, the supervisor gives its serving
-  child five seconds to clean up before bounded terminate/kill fallbacks.
+- Expect Ctrl+C to return 130. On every platform, the supervisor gives its
+  serving child five seconds to clean up before bounded terminate/kill
+  fallbacks.
 - For state that must survive machine reboot or manual restart, graduate from
   configless mode to an explicit server/client configuration.
 

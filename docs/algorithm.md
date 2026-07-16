@@ -46,11 +46,12 @@ authentication data or tunnel traffic is sent.
 
 ## Installed-package update monitor
 
-Both CLI runtimes start a lightweight asyncio task beside the server or client.
-Every five seconds by default, it reads the installed distribution version with
-`importlib.metadata`. The baseline is the version already loaded by the running
-process. Missing metadata is treated as a temporary condition because package
-installers may briefly remove old metadata before writing the replacement.
+The top-level CLI process is a supervisor on every supported platform. Every
+five seconds by default, it reads the installed distribution version with
+`importlib.metadata`. Its single business child reports the version that child
+actually imported. Missing metadata is treated as a temporary condition because
+package installers may briefly remove old metadata before writing the
+replacement.
 Only distribution metadata whose `py_frp` package directory resolves to the
 directory of the code currently loaded in memory is considered. A newer package
 installed in a shadowed system/user/virtual-environment location cannot trigger
@@ -63,11 +64,13 @@ Comparing a remote release without installing it would restart the same code in
 a loop. An external package manager is responsible for changing the installed
 distribution.
 
-Update detection and process replacement are deliberately separate modules.
-`update.py` owns installed-path selection, version comparison, and restart-loop
-suppression. `restart.py` owns argument/environment continuity, POSIX `exec`,
-the Windows child supervisor, and Ctrl+C cleanup. Neither module owns tunnel or
-TLS state.
+Update detection, process supervision, and tunnel cleanup are deliberately
+separate modules. `update.py` owns installed-path selection and the child's
+asynchronous wait for a supervisor command. `supervisor.py` owns the durable
+parent loop, version validation, retry accounting, signal cleanup, and child
+replacement. `supervisor_ipc.py` owns the generation-tagged private file
+channel. `restart.py` only returns compatibility state and the internal restart
+exit code from child to parent. None of these modules owns tunnel or TLS state.
 
 When the monitor detects a change, it follows this sequence:
 
@@ -76,37 +79,55 @@ When the monitor detects a change, it follows this sequence:
    client is ready immediately.
 2. Cancel the active runtime task. Client cancellation closes its control and
    tunnel writers and waits for tracked tunnel tasks to finish.
-3. Copy volatile restart state into internal inherited environment values.
+3. Copy volatile restart state into explicitly named internal environment
+   values.
 4. On the server, broadcast a `server_restarting` control message to every
    connected control client. Message writes run concurrently and each has a
    one-second upper bound, so a stalled peer cannot indefinitely block restart.
 5. Close the control listener and connections, public service listeners,
    pending tunnel futures, TLS context, and temporary certificate directory.
-6. Immediately launch the current Python executable with `-m py_frp` and the
-   original effective CLI arguments.
+6. Atomically write the target version and filtered compatibility state into
+   the supervisor's private channel, then exit with an internal restart code.
+7. The supervisor reaps the child and immediately launches the current Python
+   executable with `-m py_frp` and the original effective CLI arguments.
 
-There is no delay after cleanup. On Linux and macOS, the POSIX `os.execv` call
-replaces the process in place. On Windows, the first restart becomes one
-foreground supervisor attached to the terminal. It launches one serving child
-at a time. A later update makes that child return an internal restart code; the
-same supervisor immediately reaps it and launches the replacement, so wrapper
-processes do not nest across updates.
+There is no delay after cleanup. From the initial command on Linux, macOS, and
+Windows, one foreground supervisor owns the terminal and launches exactly one
+serving child. A restart returns control to that same parent; it never lets the
+shell regain ownership and never nests replacement wrappers.
 
-Ctrl+C reaches both Windows processes through their shared console. The
-supervisor restores ordinary `KeyboardInterrupt` behavior after asyncio service
-cleanup, waits up to five seconds for the child to exit cleanly, then uses
-terminate and kill as bounded fallbacks. It exits with status 130. Standalone
-entry points such as `py-frps` and `py-frpc` are normalized to the equivalent
-`python -m py_frp server/client` form while preserving their arguments.
+Ctrl+C reaches parent and child through their shared terminal; Windows
+Ctrl+Break is translated to the same Python interruption path. The business
+child performs normal asyncio cleanup while the supervisor waits up to five
+seconds, then the supervisor uses terminate and kill as bounded fallbacks.
+Additional console interrupts are ignored only during this bounded parent
+cleanup so a second signal cannot strand the child. The supervisor exits with
+status 130.
+Standalone entry points such as `py-frps` and `py-frpc` are normalized to the
+equivalent `python -m py_frp server/client` form while preserving their
+arguments.
 
 ### Restart-loop circuit breaker
 
-Before replacement, the target installed version is placed in inherited restart
-state. The replacement compares that target with the version it actually
-loaded. If they differ, it logs an error and refuses to restart toward that same
-target again. It continues running the loaded version and waits for the matching
-installation metadata to change to a different version. This circuit breaker
-limits a failed handoff to one attempt even if metadata is inconsistent.
+Every child generation receives a random generation identifier and must publish
+its PID and imported package version before it is accepted. The supervisor
+requires the process to remain alive through a one-second startup validation.
+A premature exit or a version different from the requested target is one
+replacement failure.
+
+Failures are recorded per target in a 30-second sliding window. The third
+failure opens the circuit breaker for that target. If the last wrong-version
+child is stable, it keeps serving, but the supervisor sends no further restart
+command. When installed metadata changes to a different target, the supervisor
+clears suppression and failure history; that new target gets its own bounded
+attempt cycle. A child that loads the target and passes startup validation
+clears the history immediately.
+
+The file channel lives in an owner-created temporary directory. Records are
+written through a mode-0600 temporary file, flushed, and atomically replaced.
+Every record includes the active generation, so stale child output is ignored.
+Only environment names beginning with `PY_FRP_RESTART_` cross the compatibility
+handoff; unrelated environment data is not copied through the JSON record.
 
 ### Restart-state continuity
 
@@ -129,12 +150,13 @@ configured pin, verifies every control and tunnel TLS connection against it,
 and never repeats the `y/N` question for that automatic-restart chain. An
 explicit CLI/config fingerprint takes precedence.
 
-Internal restart state is inherited by POSIX `exec` or by Windows supervisor
-children, but is not written back to the parent shell. It therefore survives
-automatic replacements but not a later manual launch. Invalid, incomplete, or
-mismatched preserved TLS material is a fatal security error rather than a reason
-to generate a different fingerprint. `--no-auto-restart` omits the monitor and
-this state-transfer path entirely.
+Internal restart state is held by the persistent supervisor and supplied only
+to its next child; it is not written back to the parent shell. It therefore
+survives automatic replacements but not a later manual launch. Invalid,
+incomplete, or mismatched preserved TLS material is a fatal security error
+rather than a reason to generate a different fingerprint. `--no-auto-restart`
+omits update monitoring and this state-transfer path, while retaining the same
+one-supervisor/one-child process shape.
 
 ## Control registration
 

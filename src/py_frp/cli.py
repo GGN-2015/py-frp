@@ -21,8 +21,10 @@ from .config import (
 )
 from .elevate import ElevationError, is_admin, relaunch_once, should_elevate_server
 from .pool import generate_tokens, parse_port_pools, token_service_name
-from .restart import restart_current_command
+from .restart import request_restart
 from .server import Server
+from .supervisor import run_supervisor
+from .supervisor_ipc import is_supervised_child, publish_child_status
 from .update import run_until_version_change
 
 
@@ -37,10 +39,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     _configure_logging(args.log_level)
 
     try:
+        if not is_supervised_child():
+            return run_supervisor(
+                effective_argv,
+                auto_restart=args.auto_restart,
+                update_interval=_positive_float(
+                    args.update_check_interval,
+                    "update check interval",
+                ),
+            )
+        publish_child_status(__version__)
         if args.command == "server":
             return _run_server_command(args, effective_argv)
         if args.command == "client":
-            return _run_client_command(args, effective_argv)
+            return _run_client_command(args)
     except KeyboardInterrupt:
         return 130
     except ConfigError as exc:
@@ -148,7 +160,7 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
         "--auto-restart",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="restart in place when the installed py-frp package version changes",
+        help="restart the supervised child when the installed package version changes",
     )
     parser.add_argument(
         "--update-check-interval",
@@ -171,14 +183,13 @@ def _run_server_command(args: argparse.Namespace, effective_argv: Sequence[str])
     return asyncio.run(
         _run_server_until_update(
             server,
-            effective_argv,
             auto_restart=args.auto_restart,
             interval=_positive_float(args.update_check_interval, "update check interval"),
         )
     )
 
 
-def _run_client_command(args: argparse.Namespace, effective_argv: Sequence[str]) -> int:
+def _run_client_command(args: argparse.Namespace) -> int:
     config = _load_client_command_config(args)
     LOGGER.info("loaded client config: %s", describe_client_config(config))
     callback = _print_assigned_ports if config.source_flavor == "token-pool" else None
@@ -191,7 +202,6 @@ def _run_client_command(args: argparse.Namespace, effective_argv: Sequence[str])
     return asyncio.run(
         _run_client_until_update(
             client,
-            effective_argv,
             auto_restart=args.auto_restart,
             interval=_positive_float(args.update_check_interval, "update check interval"),
         )
@@ -200,7 +210,6 @@ def _run_client_command(args: argparse.Namespace, effective_argv: Sequence[str])
 
 async def _run_server_until_update(
     server: Server,
-    effective_argv: Sequence[str],
     *,
     auto_restart: bool = True,
     interval: float = 5.0,
@@ -220,10 +229,7 @@ async def _run_server_until_update(
             await server.notify_restarting()
             await server.close()
             closed = True
-            restart_current_command(
-                effective_argv,
-                expected_version=change.current,
-            )
+            request_restart(change.current)
         return 0 if result is None else int(result)
     finally:
         if not closed:
@@ -232,7 +238,6 @@ async def _run_server_until_update(
 
 async def _run_client_until_update(
     client: Client,
-    effective_argv: Sequence[str],
     *,
     auto_restart: bool = True,
     interval: float = 5.0,
@@ -248,10 +253,7 @@ async def _run_client_until_update(
         change = None
     if change is not None:
         client.preserve_fingerprint_for_restart()
-        restart_current_command(
-            effective_argv,
-            expected_version=change.current,
-        )
+        request_restart(change.current)
     return 0 if result is None else int(result)
 
 

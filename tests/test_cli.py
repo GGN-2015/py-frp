@@ -6,18 +6,70 @@ import os
 import unittest
 from unittest import mock
 
+from py_frp import __version__
 from py_frp.cli import (
     POOL_TOKEN_ENV,
     _load_client_command_config,
     _load_server_command_config,
     _print_token_pool,
     build_parser,
+    main,
 )
 from py_frp.config import ConfigError
 from py_frp.pool import TOKEN_ALPHABET, token_service_name
 
 
 class CliTests(unittest.TestCase):
+    def test_initial_cli_process_delegates_to_persistent_supervisor(self) -> None:
+        arguments = [
+            "client",
+            "--server",
+            "example.com:7000",
+            "--token",
+            "secret",
+            "--no-auto-restart",
+            "--update-check-interval",
+            "1.5",
+        ]
+        with (
+            mock.patch("py_frp.cli.is_supervised_child", return_value=False),
+            mock.patch("py_frp.cli.run_supervisor", return_value=23) as supervisor,
+        ):
+            result = main(arguments)
+
+        self.assertEqual(result, 23)
+        supervisor.assert_called_once_with(
+            arguments,
+            auto_restart=False,
+            update_interval=1.5,
+        )
+
+    def test_supervised_child_reports_version_before_running_business_code(self) -> None:
+        events: list[str] = []
+        with (
+            mock.patch("py_frp.cli.is_supervised_child", return_value=True),
+            mock.patch(
+                "py_frp.cli.publish_child_status",
+                side_effect=lambda version: events.append(f"version {version}"),
+            ),
+            mock.patch(
+                "py_frp.cli._run_client_command",
+                side_effect=lambda args: events.append("client") or 7,
+            ),
+        ):
+            result = main(
+                [
+                    "client",
+                    "--server",
+                    "example.com:7000",
+                    "--token",
+                    "secret",
+                ]
+            )
+
+        self.assertEqual(result, 7)
+        self.assertEqual(events, [f"version {__version__}", "client"])
+
     def test_runtime_update_monitor_defaults_and_overrides(self) -> None:
         parser = build_parser()
         defaults = parser.parse_args(

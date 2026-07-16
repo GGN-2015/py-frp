@@ -61,33 +61,50 @@ their own `--reconnect-delay`. Older clients may ignore the unknown message,
 but the following connection close still activates their ordinary reconnect
 behavior.
 
-## Platform behavior
+## Supervisor and platform behavior
 
-| Platform | Mechanism |
-| --- | --- |
-| Linux and macOS | POSIX `exec` replaces the cleaned-up process in place |
-| Windows | One foreground supervisor rotates one serving child at a time in the same terminal |
+Linux, macOS, and Windows use the same two-process shape from the first launch:
 
-Both mechanisms retain the Python executable, effective arguments, working
-directory, environment, and terminal. The replacement begins immediately after
-cleanup. Windows uses a foreground supervisor because Windows `exec` behavior
-does not provide the same reliable terminal-attached replacement semantics as
-POSIX. Later updates return an internal code to that same supervisor, which
-reaps the old child before starting the next one; wrappers never accumulate.
+```text
+terminal -> persistent supervisor -> one server or client child
+```
 
-On Ctrl+C, the Windows supervisor allows five seconds for the serving child to
-run its asyncio cleanup. It then terminates, and finally kills, a child that
-does not stop within bounded time. The supervisor exits with status 130. On
-Linux and macOS, Ctrl+C is handled directly by the exec-replaced process.
+The supervisor owns the original terminal and remains alive while it replaces
+the business child. It always keeps exactly one child: it waits for the old
+child to finish cleanup, reaps it, and immediately starts the replacement with
+the same Python executable, effective arguments, working directory, and normal
+environment. Because the terminal-owning process never exits during a handoff,
+the shell cannot print a prompt between the restart message and the new child's
+output. POSIX `exec` is not used, and restart wrappers do not accumulate on any
+supported platform.
+
+The parent and child exchange only generation-tagged JSON records in a
+private temporary directory. A stale child cannot issue a command for the next
+generation. The child returns only py-frp's explicitly named compatibility
+state; unrelated environment secrets are not serialized into the handoff.
+
+Ctrl+C reaches both processes through their shared terminal; Windows
+Ctrl+Break is normalized to the same path. The supervisor allows five seconds
+for the child to run asyncio cleanup, then uses bounded terminate and kill
+fallbacks if needed. Further console interrupts are ignored during that short
+forced-cleanup section so they cannot strand the child. The supervisor returns
+status 130 after the child is gone.
 
 ## Restart-loop protection
 
-The target version is carried into the replacement. If the new process loads a
-different version, py-frp logs an error and suppresses every further restart
-toward that same target while continuing to serve with the loaded code. A later
-change to a different installed version may trigger one new attempt. This
-prevents inconsistent metadata or a shadowed install from creating a restart
-storm and exhausting processes, memory, handles, or disk-backed resources.
+The supervisor carries the target version into the replacement and requires
+the child to report the version it actually imported. A wrong-version child or
+a child that exits during startup counts as a failed replacement. Three
+failures toward the same target inside 30 seconds open the circuit breaker:
+py-frp logs a warning, stops requesting that target, and keeps a stable
+wrong-version child serving when one is available.
+
+Suppression is scoped to the exact target version. It is not permanent: as soon
+as installed metadata changes to another version, the supervisor clears the
+old failure history and allows a new bounded three-attempt cycle. A successful
+replacement clears its target's history immediately. This prevents inconsistent
+metadata or a shadowed install from creating a restart storm and exhausting
+processes, memory, handles, or disk-backed resources.
 
 ## Compatibility state across restart
 
@@ -106,14 +123,16 @@ it waits for that decision. Once the user confirms the fingerprint, the client
 restarts immediately and transfers the accepted complete value. It never trusts
 an unconfirmed server merely to finish an update restart.
 
-Internal restart state is inherited only by the automatic replacement. It does
-not modify the parent shell. A later manual launch is a new chain: a configless
-server creates a new token and TLS certificate, while an unpinned client asks
-again.
+Internal restart state passes through the private supervisor channel only to
+the automatic replacement. It does not modify the parent shell. A later manual
+launch is a new chain: a configless server creates a new token and TLS
+certificate, while an unpinned client asks again.
 
-`--no-auto-restart` disables both monitoring and this automatic state-transfer
-path. It is appropriate when an external service manager deliberately owns the
-entire stop/start sequence.
+`--no-auto-restart` disables update monitoring and the automatic state-transfer
+path. The lightweight terminal-owning supervisor still launches the one
+business child so signal and process ownership remain consistent on every
+platform. Use the option when an external service manager deliberately owns the
+entire update stop/start sequence.
 
 ## Exit status and logging
 

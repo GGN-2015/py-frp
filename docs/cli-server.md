@@ -121,4 +121,4 @@ Automatic update restart is enabled by default. A configless server preserves
 its generated token and TLS certificate across an automatic restart, notifies
 clients before disconnecting them, closes all listeners, and immediately starts
 the replacement command. See [Runtime and restart CLI](cli-runtime.md) for the
-complete sequence and platform differences.
+complete sequence, supervisor lifecycle, and cross-platform behavior.
