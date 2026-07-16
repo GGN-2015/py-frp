@@ -259,10 +259,12 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             client_config,
             on_registered=_capture_registered_services(assigned),
             confirm_fingerprint=_confirm_fingerprint,
+            priority=4,
         )
         client_task = asyncio.create_task(client.run())
         try:
             public_addr = await _wait_for_assigned_address(assigned)
+            self.assertEqual(assigned[0]["priority"], 4)
             reader, writer = await asyncio.open_connection(*public_addr)
             writer.write(b"hello")
             await writer.drain()
@@ -958,6 +960,184 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await first_local.wait_closed()
             await second_local.wait_closed()
 
+    async def test_priority_preemption_evicts_oldest_client_at_largest_number(self) -> None:
+        token = "priority-secret"
+        pool_ports = await _unused_tcp_ports(4)
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                allow_dynamic=False,
+                port_pool=pool_ports,
+                pool_tokens=(token,),
+                pool_bind_host="127.0.0.1",
+            )
+        )
+        await tunnel_server.start()
+        control_host, control_port = tunnel_server.control_addresses()[0]
+        connections: list[asyncio.StreamWriter] = []
+        try:
+            first_reader, first_writer, first = await _register_pool_control(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+                token,
+                priority=1,
+            )
+            connections.append(first_writer)
+            equal_reader, equal_writer, equal = await _register_pool_control(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+                token,
+                priority=3,
+            )
+            connections.append(equal_writer)
+            oldest_five_reader, oldest_five_writer, oldest_five = (
+                await _register_pool_control(
+                    control_host,
+                    control_port,
+                    tunnel_server.tls_fingerprint,
+                    token,
+                    priority=5,
+                )
+            )
+            connections.append(oldest_five_writer)
+            newest_five_reader, newest_five_writer, newest_five = (
+                await _register_pool_control(
+                    control_host,
+                    control_port,
+                    tunnel_server.tls_fingerprint,
+                    token,
+                    priority=5,
+                )
+            )
+            connections.append(newest_five_writer)
+
+            forced_reader, forced_writer, forced = await _register_pool_control(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+                token,
+                priority=3,
+                force=True,
+            )
+            connections.append(forced_writer)
+
+            first_service = _registered_service(first)
+            equal_service = _registered_service(equal)
+            oldest_five_service = _registered_service(oldest_five)
+            newest_five_service = _registered_service(newest_five)
+            forced_service = _registered_service(forced)
+            self.assertEqual(first_service["priority"], 1)
+            self.assertEqual(equal_service["priority"], 3)
+            self.assertEqual(oldest_five_service["priority"], 5)
+            self.assertEqual(newest_five_service["priority"], 5)
+            self.assertEqual(forced_service["priority"], 3)
+            self.assertEqual(
+                forced_service["bind_port"],
+                oldest_five_service["bind_port"],
+            )
+            self.assertNotEqual(
+                forced_service["bind_port"],
+                newest_five_service["bind_port"],
+            )
+            self.assertNotEqual(
+                forced_service["bind_port"],
+                equal_service["bind_port"],
+            )
+            preempted = await asyncio.wait_for(
+                read_message(oldest_five_reader),
+                timeout=1,
+            )
+            self.assertEqual((preempted or {}).get("code"), "preempted")
+            self.assertEqual((preempted or {}).get("priority"), 5)
+            self.assertEqual((preempted or {}).get("preempted_by_priority"), 3)
+
+            online_ports = {
+                address[1] for address in (await tunnel_server.online_pool_clients()).values()
+            }
+            self.assertEqual(
+                online_ports,
+                {
+                    int(first_service["bind_port"]),
+                    int(equal_service["bind_port"]),
+                    int(newest_five_service["bind_port"]),
+                    int(forced_service["bind_port"]),
+                },
+            )
+            self.assertFalse(first_reader.at_eof())
+            self.assertFalse(equal_reader.at_eof())
+            self.assertFalse(newest_five_reader.at_eof())
+            self.assertFalse(forced_reader.at_eof())
+        finally:
+            for writer in connections:
+                await close_writer(writer)
+            await tunnel_server.close()
+
+    async def test_force_priority_rejection_reports_maximum_existing_priority(self) -> None:
+        token = "priority-secret"
+        pool_ports = await _unused_tcp_ports(2)
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                allow_dynamic=False,
+                port_pool=pool_ports,
+                pool_tokens=(token,),
+                pool_bind_host="127.0.0.1",
+            )
+        )
+        await tunnel_server.start()
+        control_host, control_port = tunnel_server.control_addresses()[0]
+        connections: list[asyncio.StreamWriter] = []
+        try:
+            _, first_writer, first = await _register_pool_control(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+                token,
+                priority=1,
+            )
+            connections.append(first_writer)
+            _, second_writer, second = await _register_pool_control(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+                token,
+                priority=2,
+            )
+            connections.append(second_writer)
+
+            _, rejected_writer, rejected = await _register_pool_control(
+                control_host,
+                control_port,
+                tunnel_server.tls_fingerprint,
+                token,
+                priority=3,
+                force=True,
+            )
+            connections.append(rejected_writer)
+
+            self.assertEqual(rejected.get("type"), "error")
+            self.assertIs(rejected.get("fatal"), True)
+            self.assertEqual(rejected.get("max_priority"), 2)
+            self.assertIn("maximum existing priority is 2", str(rejected.get("error")))
+            online_ports = {
+                address[1] for address in (await tunnel_server.online_pool_clients()).values()
+            }
+            self.assertEqual(
+                online_ports,
+                {
+                    int(_registered_service(first)["bind_port"]),
+                    int(_registered_service(second)["bind_port"]),
+                },
+            )
+        finally:
+            for writer in connections:
+                await close_writer(writer)
+            await tunnel_server.close()
+
 
 async def _wait_for_service(server: Server, name: str) -> tuple[str, int]:
     for _ in range(100):
@@ -966,6 +1146,51 @@ async def _wait_for_service(server: Server, name: str) -> tuple[str, int]:
             return address
         await asyncio.sleep(0.02)
     raise AssertionError(f"service {name!r} was not registered")
+
+
+async def _register_pool_control(
+    host: str,
+    port: int,
+    fingerprint: str,
+    token: str,
+    *,
+    priority: int,
+    force: bool = False,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, dict[str, object]]:
+    reader, writer = await _open_tls_connection(host, port, fingerprint)
+    await write_message(writer, {"type": "hello", "version": 2})
+    hello = await read_message(reader)
+    if (hello or {}).get("type") != "hello":
+        raise AssertionError(f"unexpected hello response: {hello!r}")
+    registration: dict[str, object] = {
+        "type": "register",
+        "services": [
+            {
+                "name": token_service_name(token),
+                "token": token,
+                "priority": priority,
+            }
+        ],
+    }
+    if force:
+        registration["force"] = True
+    await write_message(writer, registration)
+    response = await read_message(reader)
+    if response is None:
+        raise AssertionError("server closed before registration response")
+    return reader, writer, response
+
+
+def _registered_service(message: dict[str, object]) -> dict[str, object]:
+    if message.get("type") != "registered":
+        raise AssertionError(f"registration failed: {message!r}")
+    services = message.get("services")
+    if not isinstance(services, list) or len(services) != 1:
+        raise AssertionError(f"unexpected registered services: {services!r}")
+    service = services[0]
+    if not isinstance(service, dict):
+        raise AssertionError(f"registered service is not an object: {service!r}")
+    return service
 
 
 def _capture_registered_services(target: list[dict[str, object]]):
@@ -1033,6 +1258,13 @@ async def _unused_tcp_port() -> int:
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def _unused_tcp_ports(count: int) -> tuple[int, ...]:
+    ports: set[int] = set()
+    while len(ports) < count:
+        ports.add(await _unused_tcp_port())
+    return tuple(sorted(ports))
 
 
 def _non_loopback_ipv4() -> str | None:

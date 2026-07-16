@@ -28,11 +28,24 @@ class ForceRequiredError(ResourceExhaustedError):
     """Raised when a pool client may take a port by evicting another client."""
 
 
+class PriorityPreemptionError(ResourceExhaustedError):
+    """Raised when a forced client cannot preempt any existing pool client."""
+
+    def __init__(self, priority: int, max_priority: int):
+        self.priority = priority
+        self.max_priority = max_priority
+        super().__init__(
+            f"forced connection denied: client priority {priority} cannot preempt any "
+            f"existing client; maximum existing priority is {max_priority}"
+        )
+
+
 @dataclass
 class ClientSession:
     id: str
     writer: asyncio.StreamWriter
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    created_at: float = field(default_factory=time.monotonic)
 
     async def send(self, message: dict[str, Any]) -> None:
         async with self.write_lock:
@@ -49,6 +62,7 @@ class RegisteredService:
     listener: asyncio.AbstractServer
     configured: bool
     pool_token: str | None = None
+    priority: int = 0
 
     @property
     def public_address(self) -> tuple[str, int]:
@@ -235,6 +249,7 @@ class Server:
                             "name": item.name,
                             "bind_host": item.public_address[0],
                             "bind_port": item.public_address[1],
+                            "priority": item.priority,
                         }
                         for item in registered
                     ],
@@ -259,6 +274,9 @@ class Server:
                 writer,
                 str(exc),
                 fatal=isinstance(exc, (AuthenticationError, ResourceExhaustedError)),
+                max_priority=(
+                    exc.max_priority if isinstance(exc, PriorityPreemptionError) else None
+                ),
             )
         except Exception as exc:
             LOGGER.exception("client %s handler crashed", client.id)
@@ -340,6 +358,7 @@ class Server:
         token = _optional_string(raw.get("token"))
         if token not in self._pool_tokens:
             raise AuthenticationError("authentication failed")
+        priority = _priority(raw.get("priority", 0))
 
         service_name = _pool_service_name(client)
         victim: ClientSession | None = None
@@ -353,27 +372,40 @@ class Server:
                 client,
                 service_name,
                 token,
+                priority,
             )
             if registered_service is not None:
                 return registered_service
 
-            oldest_pool_service = next(
-                (
-                    service
-                    for service in self._services.values()
-                    if service.pool_token is not None and service.client is not client
-                ),
-                None,
-            )
-            if oldest_pool_service is None:
+            pool_services = [
+                service
+                for service in self._services.values()
+                if service.pool_token is not None and service.client is not client
+            ]
+            if not pool_services:
                 raise _resource_exhausted(last_error)
             if not force:
                 raise ForceRequiredError(
                     "resource insufficient: the port pool is full; force connection can "
-                    "disconnect the oldest pool client"
+                    "disconnect an eligible equal-or-lower-priority pool client"
                 )
 
-            victim = oldest_pool_service.client
+            max_priority = max(service.priority for service in pool_services)
+            eligible_services = [
+                service for service in pool_services if service.priority >= priority
+            ]
+            if not eligible_services:
+                raise PriorityPreemptionError(priority, max_priority)
+            victim_priority = max(service.priority for service in eligible_services)
+            victim_service = min(
+                (
+                    service
+                    for service in eligible_services
+                    if service.priority == victim_priority
+                ),
+                key=lambda service: service.client.created_at,
+            )
+            victim = victim_service.client
             victim_services = [
                 service for service in self._services.values() if service.client is victim
             ]
@@ -394,6 +426,7 @@ class Server:
                 client,
                 service_name,
                 token,
+                priority,
             )
 
         for item in victim_pending:
@@ -407,15 +440,19 @@ class Server:
                     "error": "connection preempted by a forced pool connection",
                     "code": "preempted",
                     "fatal": False,
+                    "priority": victim_priority,
+                    "preempted_by_priority": priority,
                 }
             )
         except (ConnectionError, OSError, ProtocolError):
             pass
         await close_writer(victim.writer)
         LOGGER.warning(
-            "client %s was preempted by forced client %s",
+            "client %s at priority %d was preempted by forced client %s at priority %d",
             victim.id,
+            victim_priority,
             client.id,
+            priority,
         )
 
         if registered_service is None:
@@ -427,6 +464,7 @@ class Server:
         client: ClientSession,
         service_name: str,
         token: str,
+        priority: int,
     ) -> tuple[RegisteredService | None, OSError | None]:
         used_ports = {
             service.bind_port
@@ -461,6 +499,7 @@ class Server:
                 listener=listener,
                 configured=True,
                 pool_token=token,
+                priority=priority,
             )
             self._services[service_name] = registered_service
             return registered_service, last_error
@@ -614,11 +653,15 @@ async def _best_effort_error(
     error: str,
     *,
     fatal: bool = False,
+    max_priority: int | None = None,
 ) -> None:
     if writer.is_closing():
         return
     try:
-        await write_message(writer, {"type": "error", "error": error, "fatal": fatal})
+        message: dict[str, Any] = {"type": "error", "error": error, "fatal": fatal}
+        if max_priority is not None:
+            message["max_priority"] = max_priority
+        await write_message(writer, message)
     except Exception:
         pass
 
@@ -643,6 +686,12 @@ def _port(value: Any) -> int:
     if not 0 <= port <= 65535:
         raise ProtocolError("remote_port is outside the valid range")
     return port
+
+
+def _priority(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProtocolError("priority must be an integer")
+    return value
 
 
 def _server_addresses(server: asyncio.AbstractServer) -> str:

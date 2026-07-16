@@ -109,6 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="automatically force a connection when the configless server port pool is full",
     )
     client.add_argument(
+        "--priority",
+        type=int,
+        default=0,
+        help="configless pool priority; smaller numbers have higher priority",
+    )
+    client.add_argument(
         "--server-fingerprint",
         help="trusted SHA-256 TLS fingerprint; omit to confirm interactively",
     )
@@ -176,6 +182,7 @@ def _run_client_command(args: argparse.Namespace, effective_argv: Sequence[str])
         config,
         on_registered=callback,
         force_connect=args.force,
+        priority=args.priority,
     )
     return asyncio.run(
         _run_client_until_update(
@@ -268,6 +275,8 @@ def _load_client_command_config(args: argparse.Namespace) -> ClientConfig:
     if args.config:
         if args.force:
             raise ConfigError("--force is only available in configless client mode")
+        if args.priority != 0:
+            raise ConfigError("--priority is only available in configless client mode")
         return load_client_config(args.config)
     if not args.server or not args.token:
         raise ConfigError("client requires --config or both --server and --token")

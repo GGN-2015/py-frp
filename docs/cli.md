@@ -80,8 +80,9 @@ token GENERATED_TOKEN
 All authorized pool clients use this token. Each connected client receives the
 lowest currently available port. A port already occupied by another process is
 skipped. When every usable port belongs to an online pool client, the new client
-may explicitly preempt the oldest one. If no online pool client can be evicted,
-resource exhaustion remains fatal.
+may explicitly preempt an eligible client according to the priority rules
+below. If no online pool client can be evicted, resource exhaustion remains
+fatal.
 
 ### Configuration-file mode
 
@@ -126,6 +127,7 @@ The client requires either a configuration file or both `--server` and
 | `--server HOST:PORT` | none | Control address in configless mode; IPv6 may use `[addr]:port` |
 | `--token TOKEN` | none | Shared token in configless mode |
 | `--force` | off | Automatically allow pool preemption; configless mode only |
+| `--priority N` | `0` | Integer pool priority; smaller numbers have higher priority; configless mode only |
 | `--server-fingerprint VALUE` | interactive | Pin the server certificate's SHA-256 fingerprint |
 | `--local HOST:PORT` | `127.0.0.1:22` | TCP target reachable from the client |
 | `--reconnect-delay SECONDS` | `3.0` | Delay after a recoverable control disconnect |
@@ -160,22 +162,52 @@ If every pool port is assigned to an online client, the server offers a forced
 connection. Without `--force`, the client asks before continuing:
 
 ```text
-Force connection and disconnect the oldest pool client? [y/N]:
+Force connection and disconnect an eligible equal-or-lower-priority pool client? [y/N]:
 ```
 
-Answering `y` disconnects the oldest registered pool client and transfers its
-port to the current client. Any other answer stops the current client and
-leaves existing connections untouched. Use `--force` for unattended clients:
+Answering `y` retries as a forced registration. Any other answer stops the
+current client and leaves existing connections untouched. Use `--force` for
+unattended clients and `--priority` to select its pool priority:
 
 ```bash
-py-frp client --server your-server:7000 --token GENERATED_TOKEN --force
+py-frp client --server your-server:7000 --token GENERATED_TOKEN \
+  --force --priority 3
+```
+
+Priority is any integer and defaults to `0`. A smaller number means higher
+priority. An incoming client at priority `N` can preempt only an existing client
+whose priority number is greater than or equal to `N`. It cannot preempt a
+client whose number is strictly smaller than `N`.
+
+When several clients are eligible, the server first chooses the largest
+priority number—the lowest actual priority. If several eligible clients share
+that number, it chooses the one whose control connection was created earliest.
+For example:
+
+| Incoming forced client | Existing priorities | Result |
+| --- | --- | --- |
+| `3` | `-1, 2, 3, 7` | Evicts `7`; `-1` and `2` are protected, and `3` loses to the worse `7` |
+| `3` | `1, 2` | Rejected; neither existing client is eligible |
+| `3` | `3, 3` | Evicts the connection created first |
+
+No client is ever evicted merely because the pool is full. Preemption occurs
+only after a forced registration: either `--force` was supplied or the user
+accepted the interactive question. If a forced client cannot preempt anyone,
+the server returns a fatal error containing `max_priority`. The readable error
+also reports that maximum, for example:
+
+```text
+forced connection denied: client priority 3 cannot preempt any existing client;
+maximum existing priority is 2
 ```
 
 The same policy is applied after a control-channel disconnect. Consequently, a
 reconnecting client can encounter the prompt again, while a client started with
-`--force` automatically requests preemption on every reconnect. Multiple
-always-force clients competing for fewer ports can repeatedly preempt one
-another; choose reconnect delays and port-pool capacity accordingly.
+`--force` automatically requests preemption with the same priority on every
+reconnect. Automatic package restarts also retain the original CLI arguments.
+Multiple always-force clients competing for fewer ports can repeatedly preempt
+one another when their priorities permit it; choose reconnect delays and
+port-pool capacity accordingly.
 
 ### Configuration-file client
 

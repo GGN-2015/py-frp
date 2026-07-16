@@ -166,18 +166,33 @@ the connection to decline or retry the same registration with `force: true`.
 An initially forced registration, such as one produced by `--force`, skips the
 question. Under the state lock, the server then:
 
-1. Selects the earliest registered pool service.
-2. Removes every service and pending tunnel owned by that client.
-3. Closes its public listener and binds the newly freed port for the requester.
-4. Sends a non-fatal `preempted` error and closes the victim's control channel.
+1. Parse the incoming integer priority `N`; an omitted field is `0` for backward
+   compatibility.
+2. Keep only existing pool services with `priority >= N`. Lower numeric values
+   are higher priority, so services with `priority < N` are protected.
+3. If no service remains, reject the forced registration with a fatal error.
+   The response includes `max_priority`, the largest number among all existing
+   pool clients.
+4. Among eligible services, find the largest priority number. If more than one
+   has that number, select the client session with the earliest monotonic
+   connection-creation timestamp.
+5. Remove every service and pending tunnel owned by that client, close its
+   public listener, and bind the newly freed port for the requester.
+6. Send the victim a non-fatal `preempted` error containing both priorities,
+   then close its control channel.
+
+In compact form, the victim ordering key is: worst eligible numeric priority
+first, then oldest connection first. Priority affects only the forced,
+pool-full branch. Free-port allocation remains lowest-port-first, and a
+non-forced registration never disconnects another client.
 
 Closing the victim's control channel activates the ordinary client reconnect
 loop. A reconnect performs a fresh registration, so it can receive another
 `force_required` response; the interactive decision or persistent `--force`
-policy is applied each time. Allocation and victim selection are serialized by
-the server state lock. Ports occupied by unrelated operating-system processes
-do not create a force option because disconnecting a py-frp client cannot free
-them.
+policy and the original priority are applied each time. Allocation and victim
+selection are serialized by the server state lock. Ports occupied by unrelated
+operating-system processes do not create a force option because disconnecting a
+py-frp client cannot free them.
 
 ## Opening a tunnel
 

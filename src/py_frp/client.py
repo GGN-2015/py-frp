@@ -34,12 +34,14 @@ class Client:
         confirm_fingerprint: Callable[[str], bool] | None = None,
         confirm_force: Callable[[str], bool] | None = None,
         force_connect: bool = False,
+        priority: int = 0,
     ):
         self.config = config
         self.on_registered = on_registered
         self.confirm_fingerprint = confirm_fingerprint
         self.confirm_force = confirm_force
         self.force_connect = force_connect
+        self.priority = priority
         self._base_proxies = {proxy.name: proxy for proxy in config.proxies}
         self._proxies = dict(self._base_proxies)
         self._tasks: set[asyncio.Task[None]] = set()
@@ -233,7 +235,7 @@ class Client:
         try:
             answer = await asyncio.to_thread(
                 input,
-                "Force connection and disconnect the oldest pool client? [y/N]: ",
+                "Force connection and disconnect an eligible equal-or-lower-priority pool client? [y/N]: ",
             )
         except (EOFError, KeyboardInterrupt):
             return False
@@ -250,6 +252,8 @@ class Client:
                 payload["remote_host"] = proxy.remote_host
             if proxy.remote_port is not None:
                 payload["remote_port"] = proxy.remote_port
+            if self.config.source_flavor == "token-pool":
+                payload["priority"] = self.priority
             payloads.append(payload)
         return payloads
 

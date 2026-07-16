@@ -163,15 +163,35 @@ class CliTests(unittest.TestCase):
                 "--token",
                 "secret",
                 "--force",
+                "--priority",
+                "-2",
             ]
         )
 
         self.assertTrue(args.force)
+        self.assertEqual(args.priority, -2)
         self.assertEqual(_load_client_command_config(args).source_flavor, "token-pool")
+
+    def test_configless_client_priority_defaults_to_zero(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["client", "--server", "example.com:7000", "--token", "secret"]
+        )
+
+        self.assertEqual(args.priority, 0)
 
     def test_force_flag_is_rejected_with_config_file(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["client", "--config", "frpc.toml", "--force"])
+
+        with self.assertRaisesRegex(ConfigError, "configless client mode"):
+            _load_client_command_config(args)
+
+    def test_priority_is_rejected_with_config_file(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["client", "--config", "frpc.toml", "--priority", "1"]
+        )
 
         with self.assertRaisesRegex(ConfigError, "configless client mode"):
             _load_client_command_config(args)
