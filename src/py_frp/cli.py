@@ -21,8 +21,9 @@ from .config import (
 )
 from .elevate import ElevationError, is_admin, relaunch_once, should_elevate_server
 from .pool import generate_tokens, parse_port_pools, token_service_name
+from .restart import restart_current_command
 from .server import Server
-from .update import restart_current_command, run_until_version_change
+from .update import run_until_version_change
 
 
 LOGGER = logging.getLogger(__name__)
@@ -219,7 +220,10 @@ async def _run_server_until_update(
             await server.notify_restarting()
             await server.close()
             closed = True
-            restart_current_command(effective_argv)
+            restart_current_command(
+                effective_argv,
+                expected_version=change.current,
+            )
         return 0 if result is None else int(result)
     finally:
         if not closed:
@@ -244,7 +248,10 @@ async def _run_client_until_update(
         change = None
     if change is not None:
         client.preserve_fingerprint_for_restart()
-        restart_current_command(effective_argv)
+        restart_current_command(
+            effective_argv,
+            expected_version=change.current,
+        )
     return 0 if result is None else int(result)
 
 

@@ -51,15 +51,23 @@ Every five seconds by default, it reads the installed distribution version with
 `importlib.metadata`. The baseline is the version already loaded by the running
 process. Missing metadata is treated as a temporary condition because package
 installers may briefly remove old metadata before writing the replacement.
-Only a present, different version triggers restart. If multiple stale metadata
-directories exist, valid versions are parsed according to PEP 440 and the
-highest one is used, preventing an old leftover directory from causing a
-restart loop.
+Only distribution metadata whose `py_frp` package directory resolves to the
+directory of the code currently loaded in memory is considered. A newer package
+installed in a shadowed system/user/virtual-environment location cannot trigger
+a restart of a different loaded copy. If several metadata directories point to
+the same loaded package directory, valid versions are parsed according to PEP
+440 and the highest one is used.
 
 The monitor deliberately does not contact PyPI and does not install an update.
 Comparing a remote release without installing it would restart the same code in
 a loop. An external package manager is responsible for changing the installed
 distribution.
+
+Update detection and process replacement are deliberately separate modules.
+`update.py` owns installed-path selection, version comparison, and restart-loop
+suppression. `restart.py` owns argument/environment continuity, POSIX `exec`,
+the Windows child supervisor, and Ctrl+C cleanup. Neither module owns tunnel or
+TLS state.
 
 When the monitor detects a change, it follows this sequence:
 
@@ -78,14 +86,27 @@ When the monitor detects a change, it follows this sequence:
    original effective CLI arguments.
 
 There is no delay after cleanup. On Linux and macOS, the POSIX `os.execv` call
-replaces the process in place. On Windows, where `exec` does not provide the
-same reliable terminal-attached replacement semantics, the old process launches
-the replacement with `subprocess.run` in the foreground and exits with its
-return code when it eventually stops. The replacement inherits the same
-terminal, working directory, and environment, and begins while the wrapper is
-waiting. Standalone entry points such as `py-frps` and `py-frpc` are normalized
-to the equivalent `python -m py_frp server/client` form while preserving their
-arguments.
+replaces the process in place. On Windows, the first restart becomes one
+foreground supervisor attached to the terminal. It launches one serving child
+at a time. A later update makes that child return an internal restart code; the
+same supervisor immediately reaps it and launches the replacement, so wrapper
+processes do not nest across updates.
+
+Ctrl+C reaches both Windows processes through their shared console. The
+supervisor restores ordinary `KeyboardInterrupt` behavior after asyncio service
+cleanup, waits up to five seconds for the child to exit cleanly, then uses
+terminate and kill as bounded fallbacks. It exits with status 130. Standalone
+entry points such as `py-frps` and `py-frpc` are normalized to the equivalent
+`python -m py_frp server/client` form while preserving their arguments.
+
+### Restart-loop circuit breaker
+
+Before replacement, the target installed version is placed in inherited restart
+state. The replacement compares that target with the version it actually
+loaded. If they differ, it logs an error and refuses to restart toward that same
+target again. It continues running the loaded version and waits for the matching
+installation metadata to change to a different version. This circuit breaker
+limits a failed handoff to one attempt even if metadata is inconsistent.
 
 ### Restart-state continuity
 
@@ -108,11 +129,12 @@ configured pin, verifies every control and tunnel TLS connection against it,
 and never repeats the `y/N` question for that automatic-restart chain. An
 explicit CLI/config fingerprint takes precedence.
 
-Internal restart state is inherited by `exec` but is not written back to the
-parent shell. It therefore survives automatic replacements but not a later
-manual launch. Invalid, incomplete, or mismatched preserved TLS material is a
-fatal security error rather than a reason to generate a different fingerprint.
-`--no-auto-restart` omits the monitor and this state-transfer path entirely.
+Internal restart state is inherited by POSIX `exec` or by Windows supervisor
+children, but is not written back to the parent shell. It therefore survives
+automatic replacements but not a later manual launch. Invalid, incomplete, or
+mismatched preserved TLS material is a fatal security error rather than a reason
+to generate a different fingerprint. `--no-auto-restart` omits the monitor and
+this state-transfer path entirely.
 
 ## Control registration
 

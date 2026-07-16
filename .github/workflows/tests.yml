@@ -28,4 +28,4 @@ jobs:
       - name: Run test suite
         run: python -m unittest discover -s tests
       - name: Exercise terminal-attached restart
-        run: python -c "import logging; logging.basicConfig(level=logging.INFO); from py_frp.update import restart_current_command; restart_current_command(['--version'])"
+        run: python -c "import logging; logging.basicConfig(level=logging.INFO); from py_frp.restart import restart_current_command; restart_current_command(['--version'])"

@@ -34,6 +34,11 @@ the same Python environment as the running command. See the
 [deployment tutorial](tutorial.md#upgrade-a-running-server) for a complete
 example.
 
+“Same environment” also means the same import location. Python can have user,
+system, virtual-environment, and editable installations visible at once. py-frp
+checks only distribution metadata that points to the package directory actually
+loaded by the process; an update installed into a shadowed copy is ignored.
+
 ## Server restart sequence
 
 After detecting a changed installed version, the server performs these steps:
@@ -61,13 +66,28 @@ behavior.
 | Platform | Mechanism |
 | --- | --- |
 | Linux and macOS | POSIX `exec` replaces the cleaned-up process in place |
-| Windows | A replacement Python process starts in the foreground in the same terminal; the cleaned-up old process waits as its wrapper |
+| Windows | One foreground supervisor rotates one serving child at a time in the same terminal |
 
 Both mechanisms retain the Python executable, effective arguments, working
 directory, environment, and terminal. The replacement begins immediately after
-cleanup. Windows uses a foreground subprocess because Windows `exec` behavior
+cleanup. Windows uses a foreground supervisor because Windows `exec` behavior
 does not provide the same reliable terminal-attached replacement semantics as
-POSIX.
+POSIX. Later updates return an internal code to that same supervisor, which
+reaps the old child before starting the next one; wrappers never accumulate.
+
+On Ctrl+C, the Windows supervisor allows five seconds for the serving child to
+run its asyncio cleanup. It then terminates, and finally kills, a child that
+does not stop within bounded time. The supervisor exits with status 130. On
+Linux and macOS, Ctrl+C is handled directly by the exec-replaced process.
+
+## Restart-loop protection
+
+The target version is carried into the replacement. If the new process loads a
+different version, py-frp logs an error and suppresses every further restart
+toward that same target while continuing to serve with the loaded code. A later
+change to a different installed version may trigger one new attempt. This
+prevents inconsistent metadata or a shadowed install from creating a restart
+storm and exhausting processes, memory, handles, or disk-backed resources.
 
 ## Compatibility state across restart
 

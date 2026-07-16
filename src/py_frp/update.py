@@ -3,21 +3,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import subprocess
-import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from importlib import metadata
+from pathlib import Path
 from typing import TypeVar
 
 from packaging.version import InvalidVersion, Version
 
 from . import __version__
+from .restart import RESTART_TARGET_VERSION_ENV
 
 
 LOGGER = logging.getLogger(__name__)
 DISTRIBUTION_NAME = "py-simple-nat-tunnel"
 UPDATE_CHECK_INTERVAL = 5.0
+PACKAGE_DIRECTORY = Path(__file__).resolve().parent
 
 T = TypeVar("T")
 
@@ -30,12 +31,20 @@ class VersionChange:
 
 def installed_version() -> str | None:
     try:
-        candidates = {
-            distribution.version
-            for distribution in metadata.distributions(name=DISTRIBUTION_NAME)
-        }
+        distributions = metadata.distributions(name=DISTRIBUTION_NAME)
     except OSError:
         return None
+    candidates: set[str] = set()
+    for distribution in distributions:
+        try:
+            candidate_directory = Path(distribution.locate_file("py_frp")).resolve()
+        except (AttributeError, OSError, RuntimeError, TypeError):
+            continue
+        if os.path.normcase(str(candidate_directory)) != os.path.normcase(
+            str(PACKAGE_DIRECTORY)
+        ):
+            continue
+        candidates.add(distribution.version)
     parsed: list[tuple[Version, str]] = []
     for candidate in candidates:
         try:
@@ -56,6 +65,7 @@ async def wait_for_version_change(
     if interval <= 0:
         raise ValueError("update check interval must be greater than zero")
     baseline = initial_version or __version__
+    suppressed_target = _failed_restart_target(baseline)
     while True:
         await asyncio.sleep(interval)
         current = version_reader()
@@ -63,6 +73,8 @@ async def wait_for_version_change(
             LOGGER.debug("installed package version is temporarily unavailable")
             continue
         if current != baseline:
+            if current == suppressed_target:
+                continue
             return VersionChange(previous=baseline, current=current)
 
 
@@ -125,17 +137,18 @@ async def _wait_until_restart_ready(
     return change
 
 
-def restart_current_command(argv: Sequence[str]) -> None:
-    if not sys.executable:
-        raise RuntimeError("cannot restart because the Python executable is unknown")
-    command = [sys.executable, "-m", "py_frp", *argv]
-    LOGGER.info("restarting command in current terminal: %s", command)
-    if os.name == "nt":
-        completed = subprocess.run(
-            command,
-            cwd=os.getcwd(),
-            env=os.environ.copy(),
-            check=False,
-        )
-        raise SystemExit(completed.returncode)
-    os.execv(sys.executable, command)
+def _failed_restart_target(loaded_version: str) -> str | None:
+    target = os.environ.get(RESTART_TARGET_VERSION_ENV)
+    if not target:
+        return None
+    if target == loaded_version:
+        os.environ.pop(RESTART_TARGET_VERSION_ENV, None)
+        return None
+    LOGGER.error(
+        "automatic restart expected package version %s but loaded %s; "
+        "suppressing another restart toward %s until the installed version changes",
+        target,
+        loaded_version,
+        target,
+    )
+    return target
