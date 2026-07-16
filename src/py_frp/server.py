@@ -142,6 +142,11 @@ class Server:
             raise RuntimeError("server has not been started")
         return self._tls.fingerprint
 
+    def preserve_tls_for_restart(self) -> None:
+        if self._tls is None:
+            raise RuntimeError("server has not been started")
+        self._tls.preserve_for_restart()
+
     def service_address(self, name: str) -> tuple[str, int] | None:
         service = self._services.get(name)
         return None if service is None else service.public_address

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import hashlib
 import hmac
 import ipaddress
+import os
 import re
 import ssl
 import tempfile
@@ -20,17 +23,63 @@ class SecurityError(RuntimeError):
     """Raised when TLS setup or server identity verification fails."""
 
 
+RESTART_CERT_ENV = "PY_FRP_RESTART_TLS_CERT"
+RESTART_KEY_ENV = "PY_FRP_RESTART_TLS_KEY"
+RESTART_SERVER_FINGERPRINT_ENV = "PY_FRP_RESTART_SERVER_FINGERPRINT"
+
+
 @dataclass
 class ServerTLS:
     context: ssl.SSLContext
     fingerprint: str
     _directory: tempfile.TemporaryDirectory[str]
+    _certificate_pem: bytes
+    _private_key_pem: bytes
 
     def close(self) -> None:
         self._directory.cleanup()
 
+    def preserve_for_restart(self) -> None:
+        os.environ[RESTART_CERT_ENV] = base64.b64encode(self._certificate_pem).decode("ascii")
+        os.environ[RESTART_KEY_ENV] = base64.b64encode(self._private_key_pem).decode("ascii")
+
 
 def create_server_tls(bind_host: str) -> ServerTLS:
+    restored = _restored_tls_material()
+    if restored is None:
+        certificate_pem, private_key_pem = _generate_tls_material(bind_host)
+    else:
+        certificate_pem, private_key_pem = restored
+    try:
+        certificate = x509.load_pem_x509_certificate(certificate_pem)
+    except ValueError as exc:
+        raise SecurityError("preserved TLS certificate is invalid") from exc
+
+    directory = tempfile.TemporaryDirectory(prefix="py-frp-tls-")
+    root = Path(directory.name)
+    cert_path = root / "server-cert.pem"
+    key_path = root / "server-key.pem"
+    cert_path.write_bytes(certificate_pem)
+    key_path.write_bytes(private_key_pem)
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    except (OSError, ssl.SSLError) as exc:
+        directory.cleanup()
+        raise SecurityError("preserved TLS certificate and private key are invalid") from exc
+    fingerprint = format_fingerprint(certificate.fingerprint(hashes.SHA256()))
+    return ServerTLS(
+        context=context,
+        fingerprint=fingerprint,
+        _directory=directory,
+        _certificate_pem=certificate_pem,
+        _private_key_pem=private_key_pem,
+    )
+
+
+def _generate_tls_material(bind_host: str) -> tuple[bytes, bytes]:
     private_key = ec.generate_private_key(ec.SECP256R1())
     subject = issuer = x509.Name(
         [x509.NameAttribute(NameOID.COMMON_NAME, "py-frp ephemeral server")]
@@ -55,25 +104,30 @@ def create_server_tls(bind_host: str) -> ServerTLS:
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(private_key, hashes.SHA256())
     )
-
-    directory = tempfile.TemporaryDirectory(prefix="py-frp-tls-")
-    root = Path(directory.name)
-    cert_path = root / "server-cert.pem"
-    key_path = root / "server-key.pem"
-    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
+    return (
+        certificate.public_bytes(serialization.Encoding.PEM),
         private_key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
-        )
+        ),
     )
 
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(certfile=cert_path, keyfile=key_path)
-    fingerprint = format_fingerprint(certificate.fingerprint(hashes.SHA256()))
-    return ServerTLS(context=context, fingerprint=fingerprint, _directory=directory)
+
+def _restored_tls_material() -> tuple[bytes, bytes] | None:
+    certificate = os.environ.get(RESTART_CERT_ENV)
+    private_key = os.environ.get(RESTART_KEY_ENV)
+    if not certificate and not private_key:
+        return None
+    if not certificate or not private_key:
+        raise SecurityError("preserved TLS restart state is incomplete")
+    try:
+        return (
+            base64.b64decode(certificate, validate=True),
+            base64.b64decode(private_key, validate=True),
+        )
+    except (ValueError, binascii.Error) as exc:
+        raise SecurityError("preserved TLS restart state is invalid") from exc
 
 
 def create_client_tls_context() -> ssl.SSLContext:

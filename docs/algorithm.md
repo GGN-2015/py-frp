@@ -39,6 +39,70 @@ Fingerprint comparisons normalize case and separators, then use a
 constant-time comparison. A different certificate aborts the connection before
 authentication data or tunnel traffic is sent.
 
+## Installed-package update monitor
+
+Both CLI runtimes start a lightweight asyncio task beside the server or client.
+Every five seconds by default, it reads the installed distribution version with
+`importlib.metadata`. The baseline is the version already loaded by the running
+process. Missing metadata is treated as a temporary condition because package
+installers may briefly remove old metadata before writing the replacement.
+Only a present, different version triggers restart. If multiple stale metadata
+directories exist, valid versions are parsed according to PEP 440 and the
+highest one is used, preventing an old leftover directory from causing a
+restart loop.
+
+The monitor deliberately does not contact PyPI and does not install an update.
+Comparing a remote release without installing it would restart the same code in
+a loop. An external package manager is responsible for changing the installed
+distribution.
+
+When the monitor detects a change, it follows this sequence:
+
+1. For a client without an explicit fingerprint, wait until the current server
+   fingerprint has been confirmed. An already connected or explicitly pinned
+   client is ready immediately.
+2. Cancel the active runtime task. Client cancellation closes its control and
+   tunnel writers and waits for tracked tunnel tasks to finish.
+3. Copy volatile restart state into internal inherited environment values.
+4. On the server, close the control listener, public service listeners, pending
+   tunnel futures, TLS context, and temporary certificate directory.
+5. Immediately call `os.execv` with the current Python executable,
+   `-m py_frp`, and the original effective CLI arguments.
+
+The `exec` call occurs inside the monitoring coroutine directly after cleanup.
+It does not return through `asyncio.run`, wait for a timer, query the network,
+or ask for confirmation. The working directory and terminal stay attached to
+the replacement process. Standalone entry points such as `py-frps` and
+`py-frpc` are normalized to the equivalent `python -m py_frp server/client`
+form while preserving their arguments.
+
+### Restart-state continuity
+
+In configless pool mode, the first server process generates one random shared
+token as usual. Before an automatic restart, the token is placed in an internal
+environment value. The replacement process consumes that value instead of
+calling the token generator, so client authentication remains compatible over
+any number of consecutive automatic restarts.
+
+The server also serializes its PEM certificate and matching EC private key into
+base64 environment values before deleting the old temporary files. The new
+process recreates fresh temporary files from the same material. Consequently,
+the SHA-256 certificate fingerprint is byte-for-byte identical and pinned
+clients accept the restarted server.
+
+After an interactive client accepts a server fingerprint, it keeps the
+normalized value in memory and copies it to inherited restart state immediately
+before replacement. The replacement client treats that value exactly like a
+configured pin, verifies every control and tunnel TLS connection against it,
+and never repeats the `y/N` question for that automatic-restart chain. An
+explicit CLI/config fingerprint takes precedence.
+
+Internal restart state is inherited by `exec` but is not written back to the
+parent shell. It therefore survives automatic replacements but not a later
+manual launch. Invalid, incomplete, or mismatched preserved TLS material is a
+fatal security error rather than a reason to generate a different fingerprint.
+`--no-auto-restart` omits the monitor and this state-transfer path entirely.
+
 ## Control registration
 
 Control messages are compact UTF-8 JSON objects terminated by a newline. A

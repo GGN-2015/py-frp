@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -10,6 +11,7 @@ from .config import ClientConfig
 from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
 from .security import (
     SecurityError,
+    RESTART_SERVER_FINGERPRINT_ENV,
     create_client_tls_context,
     fingerprints_equal,
     normalize_fingerprint,
@@ -42,11 +44,29 @@ class Client:
         self._proxies = dict(self._base_proxies)
         self._tasks: set[asyncio.Task[None]] = set()
         self._tls_context = create_client_tls_context()
+        configured_fingerprint = (
+            config.server_fingerprint
+            or os.environ.get(RESTART_SERVER_FINGERPRINT_ENV)
+            or None
+        )
         self._trusted_fingerprint = (
-            normalize_fingerprint(config.server_fingerprint)
-            if config.server_fingerprint is not None
+            normalize_fingerprint(configured_fingerprint)
+            if configured_fingerprint is not None
             else None
         )
+        self._fingerprint_ready = asyncio.Event()
+        if self._trusted_fingerprint is not None:
+            self._fingerprint_ready.set()
+
+    def preserve_fingerprint_for_restart(self) -> None:
+        if self._trusted_fingerprint is None:
+            raise SecurityError(
+                "cannot restart safely before a server TLS fingerprint has been trusted"
+            )
+        os.environ[RESTART_SERVER_FINGERPRINT_ENV] = self._trusted_fingerprint
+
+    async def wait_until_fingerprint_trusted(self) -> None:
+        await self._fingerprint_ready.wait()
 
     async def run(self) -> None:
         while True:
@@ -175,6 +195,7 @@ class Client:
         if not confirmed:
             raise SecurityError("server fingerprint was rejected")
         self._trusted_fingerprint = fingerprint
+        self._fingerprint_ready.set()
 
     async def _read_control_message(
         self,

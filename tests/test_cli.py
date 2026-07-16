@@ -2,14 +2,43 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import unittest
+from unittest import mock
 
-from py_frp.cli import build_parser, _load_client_command_config, _load_server_command_config, _print_token_pool
+from py_frp.cli import (
+    POOL_TOKEN_ENV,
+    _load_client_command_config,
+    _load_server_command_config,
+    _print_token_pool,
+    build_parser,
+)
 from py_frp.config import ConfigError
 from py_frp.pool import TOKEN_ALPHABET, token_service_name
 
 
 class CliTests(unittest.TestCase):
+    def test_runtime_update_monitor_defaults_and_overrides(self) -> None:
+        parser = build_parser()
+        defaults = parser.parse_args(
+            ["client", "--server", "example.com:7000", "--token", "secret"]
+        )
+        disabled = parser.parse_args(
+            [
+                "server",
+                "--port-pool",
+                "6000",
+                "--no-auto-restart",
+                "--update-check-interval",
+                "1.5",
+            ]
+        )
+
+        self.assertTrue(defaults.auto_restart)
+        self.assertEqual(defaults.update_check_interval, 5.0)
+        self.assertFalse(disabled.auto_restart)
+        self.assertEqual(disabled.update_check_interval, 1.5)
+
     def test_configless_server_generates_one_shared_token_for_pool(self) -> None:
         parser = build_parser()
         args = parser.parse_args(
@@ -67,6 +96,17 @@ class CliTests(unittest.TestCase):
 
         token_lines = [line for line in output.getvalue().splitlines() if line.startswith("token ")]
         self.assertEqual(token_lines, [f"token {config.pool_tokens[0]}"])
+
+    def test_configless_server_reuses_token_preserved_for_restart(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["server", "--port-pool", "6000-6002", "--token-length", "8"]
+        )
+
+        with mock.patch.dict(os.environ, {POOL_TOKEN_ENV: "preserved-token"}):
+            config = _load_server_command_config(args)
+
+        self.assertEqual(config.pool_tokens, ("preserved-token",))
 
     def test_configless_client_uses_token_service_name(self) -> None:
         parser = build_parser()

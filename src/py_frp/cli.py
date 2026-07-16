@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from collections.abc import Sequence
 
@@ -21,9 +22,11 @@ from .config import (
 from .elevate import ElevationError, is_admin, relaunch_once, should_elevate_server
 from .pool import generate_tokens, parse_port_pools, token_service_name
 from .server import Server
+from .update import restart_current_command, run_until_version_change
 
 
 LOGGER = logging.getLogger(__name__)
+POOL_TOKEN_ENV = "PY_FRP_RESTART_POOL_TOKEN"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -36,7 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "server":
             return _run_server_command(args, effective_argv)
         if args.command == "client":
-            return _run_client_command(args)
+            return _run_client_command(args, effective_argv)
     except KeyboardInterrupt:
         return 130
     except ConfigError as exc:
@@ -131,6 +134,18 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="logging level",
     )
+    parser.add_argument(
+        "--auto-restart",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="restart in place when the installed py-frp package version changes",
+    )
+    parser.add_argument(
+        "--update-check-interval",
+        type=float,
+        default=5.0,
+        help="seconds between installed package version checks",
+    )
 
 
 def _run_server_command(args: argparse.Namespace, effective_argv: Sequence[str]) -> int:
@@ -142,21 +157,84 @@ def _run_server_command(args: argparse.Namespace, effective_argv: Sequence[str])
         return relaunch_once(effective_argv)
     if config.port_pool:
         _print_token_pool(config)
-    return asyncio.run(Server(config).serve_forever())
+    server = Server(config)
+    return asyncio.run(
+        _run_server_until_update(
+            server,
+            effective_argv,
+            auto_restart=args.auto_restart,
+            interval=_positive_float(args.update_check_interval, "update check interval"),
+        )
+    )
 
 
-def _run_client_command(args: argparse.Namespace) -> int:
+def _run_client_command(args: argparse.Namespace, effective_argv: Sequence[str]) -> int:
     config = _load_client_command_config(args)
     LOGGER.info("loaded client config: %s", describe_client_config(config))
     callback = _print_assigned_ports if config.source_flavor == "token-pool" else None
-    asyncio.run(
-        Client(
-            config,
-            on_registered=callback,
-            force_connect=args.force,
-        ).run()
+    client = Client(
+        config,
+        on_registered=callback,
+        force_connect=args.force,
     )
-    return 0
+    return asyncio.run(
+        _run_client_until_update(
+            client,
+            effective_argv,
+            auto_restart=args.auto_restart,
+            interval=_positive_float(args.update_check_interval, "update check interval"),
+        )
+    )
+
+
+async def _run_server_until_update(
+    server: Server,
+    effective_argv: Sequence[str],
+    *,
+    auto_restart: bool = True,
+    interval: float = 5.0,
+) -> int:
+    closed = False
+    try:
+        if auto_restart:
+            result, change = await run_until_version_change(
+                server.serve_forever(),
+                interval=interval,
+            )
+        else:
+            result = await server.serve_forever()
+            change = None
+        if change is not None:
+            _preserve_server_restart_state(server)
+            await server.close()
+            closed = True
+            restart_current_command(effective_argv)
+        return 0 if result is None else int(result)
+    finally:
+        if not closed:
+            await server.close()
+
+
+async def _run_client_until_update(
+    client: Client,
+    effective_argv: Sequence[str],
+    *,
+    auto_restart: bool = True,
+    interval: float = 5.0,
+) -> int:
+    if auto_restart:
+        result, change = await run_until_version_change(
+            client.run(),
+            interval=interval,
+            restart_ready=client.wait_until_fingerprint_trusted,
+        )
+    else:
+        result = await client.run()
+        change = None
+    if change is not None:
+        client.preserve_fingerprint_for_restart()
+        restart_current_command(effective_argv)
+    return 0 if result is None else int(result)
 
 
 def _load_server_command_config(args: argparse.Namespace) -> ServerConfig:
@@ -165,7 +243,8 @@ def _load_server_command_config(args: argparse.Namespace) -> ServerConfig:
     if not args.port_pool:
         raise ConfigError("server requires --config or --port-pool")
     ports = parse_port_pools(args.port_pool)
-    tokens = generate_tokens(1, length=args.token_length)
+    preserved_token = os.environ.get(POOL_TOKEN_ENV)
+    tokens = (preserved_token,) if preserved_token else generate_tokens(1, length=args.token_length)
     return ServerConfig(
         bind_host=args.bind_host,
         bind_port=args.bind_port,
@@ -176,6 +255,13 @@ def _load_server_command_config(args: argparse.Namespace) -> ServerConfig:
         pool_tokens=tokens,
         pool_bind_host=args.pool_bind_host or args.bind_host,
     )
+
+
+def _preserve_server_restart_state(server: Server) -> None:
+    config = server.config
+    if config.source_flavor == "token-pool" and config.pool_tokens:
+        os.environ[POOL_TOKEN_ENV] = config.pool_tokens[0]
+    server.preserve_tls_for_restart()
 
 
 def _load_client_command_config(args: argparse.Namespace) -> ClientConfig:

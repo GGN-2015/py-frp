@@ -47,6 +47,8 @@ The server requires either a configuration file or at least one `--port-pool`.
 | `--token-length N` | `24` | Length of the generated shared pool token |
 | `--elevate` | off | Request one administrator/root relaunch before binding |
 | `--auto-elevate`, `--no-auto-elevate` | on | Enable or disable automatic elevation for ports below 1024 |
+| `--auto-restart`, `--no-auto-restart` | on | Enable or disable restart after an installed package version change |
+| `--update-check-interval SECONDS` | `5.0` | Seconds between installed package version checks |
 | `--log-level LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 
 ### Configless port-pool mode
@@ -129,9 +131,11 @@ The client requires either a configuration file or both `--server` and
 | `--reconnect-delay SECONDS` | `3.0` | Delay after a recoverable control disconnect |
 | `--connect-timeout SECONDS` | `10.0` | Timeout while opening the local target |
 | `--heartbeat-interval SECONDS` | `30.0` | Interval between control-channel pings |
+| `--auto-restart`, `--no-auto-restart` | on | Enable or disable restart after an installed package version change |
+| `--update-check-interval SECONDS` | `5.0` | Seconds between installed package version checks |
 | `--log-level LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 
-All three time values must be greater than zero.
+All numeric timeout and interval values must be greater than zero.
 
 ### Configless client
 
@@ -253,6 +257,54 @@ TLS protects only the server-to-client segment. The public connection to the
 server and the client connection to the target are separate plain TCP segments;
 use an application protocol such as SSH or HTTPS when end-to-end encryption is
 required.
+
+## Automatic restart after package updates
+
+The server and client check the locally installed `py-simple-nat-tunnel`
+distribution metadata every five seconds by default. When its version differs
+from the version currently loaded in memory, the process cleans up and
+immediately replaces itself with:
+
+```text
+CURRENT_PYTHON -m py_frp ORIGINAL_ARGUMENTS...
+```
+
+The Python executable, command arguments, working directory, environment, and
+terminal are retained. There is no sleep, confirmation, PyPI request, or second
+version check between resource cleanup and process replacement. This feature
+detects an update installed by another command such as `pip install --upgrade`;
+it does not query PyPI or install packages by itself.
+
+Control the behavior on either `server` or `client`:
+
+```bash
+py-frp server -c examples/frps.toml --update-check-interval 2
+py-frp client -c examples/frpc.toml --no-auto-restart
+```
+
+The interval must be greater than zero. `--no-auto-restart` disables both the
+periodic check and automatic process replacement.
+
+Automatic restart preserves volatile compatibility state:
+
+- A configless server reuses its generated pool token, so existing clients can
+  authenticate after the restart.
+- The server restores the same ephemeral TLS certificate and private key, so
+  its printed SHA-256 fingerprint does not change.
+- A client that originally used interactive fingerprint confirmation carries
+  the confirmed fingerprint into the new process and pins it automatically.
+  It does not ask for `y/N` again.
+
+If a client notices a package update before its first server fingerprint has
+been confirmed, it leaves the current connection flow running until that
+fingerprint is confirmed. It then performs the immediate restart and pins the
+confirmed value in the new process. This avoids silently trusting an
+unconfirmed certificate.
+
+The restart state is passed only through the child process environment created
+by in-place replacement. It does not change the parent shell. A later manual
+start is a fresh session: a configless server generates a new token and TLS
+certificate, and an unpinned client asks for fingerprint confirmation again.
 
 ## Privileged ports
 
