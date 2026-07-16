@@ -7,8 +7,9 @@ import ipaddress
 import socket
 import struct
 import unittest
+from unittest import mock
 
-from py_frp.client import Client
+from py_frp.client import Client, ServerRestartingError
 from py_frp.cli import _load_client_command_config, build_parser
 from py_frp.config import ClientConfig, ProxyConfig, ServerConfig, ServerServiceConfig
 from py_frp.pool import token_service_name
@@ -135,6 +136,79 @@ class TunnelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await close_writer(writer)
             await tunnel_server.close()
+
+    async def test_server_restart_notice_requests_delayed_client_reconnect(self) -> None:
+        tunnel_server = Server(
+            ServerConfig(
+                bind_host="127.0.0.1",
+                bind_port=0,
+                token="secret",
+                allow_dynamic=True,
+            )
+        )
+        await tunnel_server.start()
+        control_port = tunnel_server.control_addresses()[0][1]
+        client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=control_port,
+                token="secret",
+                reconnect_delay=5.0,
+                proxies=(
+                    ProxyConfig(
+                        name="restart-test",
+                        local_host="127.0.0.1",
+                        local_port=1,
+                        remote_host="127.0.0.1",
+                        remote_port=0,
+                    ),
+                ),
+            ),
+            confirm_fingerprint=_confirm_fingerprint,
+        )
+        client_task = asyncio.create_task(client._run_once())
+        try:
+            await _wait_for_service(tunnel_server, "restart-test")
+            await tunnel_server.notify_restarting(retry_after=3.0)
+
+            with self.assertRaises(ServerRestartingError) as raised:
+                await asyncio.wait_for(client_task, timeout=1)
+            self.assertEqual(raised.exception.retry_after, 5.0)
+        finally:
+            if not client_task.done():
+                client_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await client_task
+            await tunnel_server.close()
+
+    async def test_client_backs_off_after_server_restart_notice(self) -> None:
+        client = Client(
+            ClientConfig(
+                server_host="127.0.0.1",
+                server_port=7000,
+                reconnect_delay=1.0,
+                proxies=(
+                    ProxyConfig(
+                        name="restart-test",
+                        local_host="127.0.0.1",
+                        local_port=1,
+                        remote_port=6000,
+                    ),
+                ),
+            )
+        )
+        with (
+            mock.patch.object(
+                client,
+                "_run_once",
+                side_effect=(ServerRestartingError(4.0), asyncio.CancelledError()),
+            ),
+            mock.patch("py_frp.client.asyncio.sleep", new_callable=mock.AsyncMock) as sleep,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await client.run()
+
+        sleep.assert_awaited_once_with(4.0)
 
     async def test_tcp_reverse_tunnel_round_trip(self) -> None:
         async def echo(

@@ -14,6 +14,7 @@ from .security import ServerTLS, create_server_tls
 
 
 LOGGER = logging.getLogger(__name__)
+SERVER_RESTART_RETRY_DELAY = 3.0
 
 
 class AuthenticationError(ProtocolError):
@@ -90,6 +91,7 @@ class Server:
         self._pool_tokens = set(config.pool_tokens)
         self._services: dict[str, RegisteredService] = {}
         self._pending: dict[str, PendingTunnel] = {}
+        self._clients: dict[str, ClientSession] = {}
         self._lock = asyncio.Lock()
         self._server: asyncio.AbstractServer | None = None
         self._tls: ServerTLS | None = None
@@ -133,6 +135,8 @@ class Server:
             self._services.clear()
             pending = list(self._pending.values())
             self._pending.clear()
+            clients = list(self._clients.values())
+            self._clients.clear()
 
         for item in pending:
             if not item.future.done():
@@ -142,8 +146,37 @@ class Server:
             service.listener.close()
         await asyncio.gather(
             *(service.listener.wait_closed() for service in services),
+            *(close_writer(client.writer) for client in clients),
             return_exceptions=True,
         )
+
+    async def notify_restarting(
+        self,
+        retry_after: float = SERVER_RESTART_RETRY_DELAY,
+    ) -> None:
+        if retry_after <= 0:
+            raise ValueError("restart retry delay must be greater than zero")
+        async with self._lock:
+            clients = list(self._clients.values())
+        message = {
+            "type": "server_restarting",
+            "reason": "package_update",
+            "retry_after": retry_after,
+        }
+        await asyncio.gather(
+            *(self._notify_restarting_client(client, message) for client in clients),
+            return_exceptions=True,
+        )
+
+    async def _notify_restarting_client(
+        self,
+        client: ClientSession,
+        message: dict[str, Any],
+    ) -> None:
+        try:
+            await asyncio.wait_for(client.send(message), timeout=1.0)
+        except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError):
+            LOGGER.debug("could not notify restarting client %s", client.id)
 
     def control_addresses(self) -> tuple[tuple[str, int], ...]:
         if self._server is None or self._server.sockets is None:
@@ -204,6 +237,8 @@ class Server:
         writer: asyncio.StreamWriter,
     ) -> None:
         client = ClientSession(id=uuid.uuid4().hex, writer=writer)
+        async with self._lock:
+            self._clients[client.id] = client
         try:
             current = first
             if current.get("type") == "hello":
@@ -550,6 +585,7 @@ class Server:
 
     async def _remove_client(self, client: ClientSession) -> None:
         async with self._lock:
+            self._clients.pop(client.id, None)
             services = [item for item in self._services.values() if item.client is client]
             for service in services:
                 self._services.pop(service.name, None)

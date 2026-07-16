@@ -125,6 +125,9 @@ class UpdateTests(unittest.IsolatedAsyncioTestCase):
             async def close(self) -> None:
                 events.append("server closed")
 
+            async def notify_restarting(self) -> None:
+                events.append("clients notified")
+
             def preserve_tls_for_restart(self) -> None:
                 events.append("TLS preserved")
 
@@ -155,13 +158,20 @@ class UpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             events,
-            ["runtime cleaned", "TLS preserved", "server closed", "restarted"],
+            [
+                "runtime cleaned",
+                "TLS preserved",
+                "clients notified",
+                "server closed",
+                "restarted",
+            ],
         )
         self.assertEqual(preserved_tokens, ["same-random-token"])
 
-    def test_restart_uses_current_python_and_preserves_arguments(self) -> None:
+    def test_posix_restart_executes_current_python_with_preserved_arguments(self) -> None:
         with (
             mock.patch("py_frp.update.sys.executable", "C:\\Python\\python.exe"),
+            mock.patch("py_frp.update.os.name", "posix"),
             mock.patch("py_frp.update.os.execv") as execv,
         ):
             restart_current_command(
@@ -180,6 +190,35 @@ class UpdateTests(unittest.IsolatedAsyncioTestCase):
                 "--force",
             ],
         )
+
+    def test_windows_restart_runs_replacement_in_foreground_terminal(self) -> None:
+        completed = SimpleNamespace(returncode=23)
+        with (
+            mock.patch("py_frp.update.sys.executable", "C:\\Python\\python.exe"),
+            mock.patch("py_frp.update.os.name", "nt"),
+            mock.patch("py_frp.update.subprocess.run", return_value=completed) as run,
+            mock.patch("py_frp.update.os.execv") as execv,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            restart_current_command(["server", "--port-pool", "6000"])
+
+        self.assertEqual(raised.exception.code, 23)
+        execv.assert_not_called()
+        args, kwargs = run.call_args
+        self.assertEqual(
+            args[0],
+            [
+                "C:\\Python\\python.exe",
+                "-m",
+                "py_frp",
+                "server",
+                "--port-pool",
+                "6000",
+            ],
+        )
+        self.assertEqual(kwargs["cwd"], os.getcwd())
+        self.assertEqual(kwargs["env"], os.environ.copy())
+        self.assertFalse(kwargs["check"])
 
 
 if __name__ == "__main__":

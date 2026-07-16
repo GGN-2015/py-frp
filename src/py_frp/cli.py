@@ -213,6 +213,7 @@ async def _run_server_until_update(
             change = None
         if change is not None:
             _preserve_server_restart_state(server)
+            await server.notify_restarting()
             await server.close()
             closed = True
             restart_current_command(effective_argv)

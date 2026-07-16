@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections.abc import Callable
@@ -24,6 +25,14 @@ LOGGER = logging.getLogger(__name__)
 
 class FatalClientError(RuntimeError):
     """Raised when the server says reconnecting would repeat the same failure."""
+
+
+class ServerRestartingError(ConnectionError):
+    """Raised when the server requests a delayed reconnect during restart."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"server is restarting; retry after {retry_after:.1f}s")
 
 
 class Client:
@@ -85,6 +94,13 @@ class Client:
                 LOGGER.error("%s", exc)
                 await self._cancel_tunnel_tasks()
                 return
+            except ServerRestartingError as exc:
+                LOGGER.info(
+                    "server is restarting; reconnecting in %.1fs",
+                    exc.retry_after,
+                )
+                await self._cancel_tunnel_tasks()
+                await asyncio.sleep(exc.retry_after)
             except Exception as exc:
                 LOGGER.warning(
                     "client connection failed: %s; reconnecting in %.1fs",
@@ -146,6 +162,10 @@ class Client:
                     LOGGER.debug("received pong")
                 elif message.get("type") == "error":
                     _raise_error_response(message)
+                elif message.get("type") == "server_restarting":
+                    raise ServerRestartingError(
+                        _server_restart_delay(message, self.config.reconnect_delay)
+                    )
                 else:
                     LOGGER.debug("ignored control message: %s", message)
         finally:
@@ -351,3 +371,16 @@ def _raise_error_response(message: dict[str, Any]) -> None:
     if message.get("fatal") is True:
         raise FatalClientError(error)
     raise ProtocolError(error)
+
+
+def _server_restart_delay(message: dict[str, Any], reconnect_delay: float) -> float:
+    raw_delay = message.get("retry_after")
+    if isinstance(raw_delay, bool):
+        return reconnect_delay
+    try:
+        suggested = float(raw_delay)
+    except (TypeError, ValueError):
+        return reconnect_delay
+    if not math.isfinite(suggested) or suggested <= 0:
+        return reconnect_delay
+    return max(reconnect_delay, suggested)

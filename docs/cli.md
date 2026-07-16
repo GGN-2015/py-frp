@@ -303,9 +303,21 @@ CURRENT_PYTHON -m py_frp ORIGINAL_ARGUMENTS...
 
 The Python executable, command arguments, working directory, environment, and
 terminal are retained. There is no sleep, confirmation, PyPI request, or second
-version check between resource cleanup and process replacement. This feature
-detects an update installed by another command such as `pip install --upgrade`;
-it does not query PyPI or install packages by itself.
+version check after resource cleanup. This feature detects an update installed
+by another command such as `pip install --upgrade`; it does not query PyPI or
+install packages by itself.
+
+The restart mechanism matches each operating system:
+
+| Platform | Restart behavior |
+| --- | --- |
+| Linux and macOS | Uses POSIX `exec`, replacing the old process in place |
+| Windows | Starts the replacement Python process in the foreground, attached to the same terminal; the cleaned-up old process waits only as its wrapper |
+
+On either path, the replacement starts immediately after the old network and
+TLS resources have been closed. In particular, Windows does not use `exec`,
+whose process-replacement behavior is not equivalent to POSIX and could leave a
+service apparently stopped at the restart log line.
 
 Control the behavior on either `server` or `client`:
 
@@ -326,6 +338,14 @@ Automatic restart preserves volatile compatibility state:
 - A client that originally used interactive fingerprint confirmation carries
   the confirmed fingerprint into the new process and pins it automatically.
   It does not ask for `y/N` again.
+
+Before an automatically updating server closes its connections, it sends every
+connected client a `server_restarting` notice with a three-second suggested
+retry delay. A current client logs the notice, disconnects cleanly, and waits
+the larger of that suggestion and its own `--reconnect-delay` before connecting
+again. This prevents a reconnect storm while the replacement server is binding
+its listeners. Older clients that do not understand the notice are still
+disconnected and fall back to their normal reconnect behavior.
 
 If a client notices a package update before its first server fingerprint has
 been confirmed, it leaves the current connection flow running until that

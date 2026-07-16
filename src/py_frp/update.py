@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -129,4 +130,12 @@ def restart_current_command(argv: Sequence[str]) -> None:
         raise RuntimeError("cannot restart because the Python executable is unknown")
     command = [sys.executable, "-m", "py_frp", *argv]
     LOGGER.info("restarting command in current terminal: %s", command)
+    if os.name == "nt":
+        completed = subprocess.run(
+            command,
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+            check=False,
+        )
+        raise SystemExit(completed.returncode)
     os.execv(sys.executable, command)

@@ -64,17 +64,23 @@ When the monitor detects a change, it follows this sequence:
 2. Cancel the active runtime task. Client cancellation closes its control and
    tunnel writers and waits for tracked tunnel tasks to finish.
 3. Copy volatile restart state into internal inherited environment values.
-4. On the server, close the control listener, public service listeners, pending
-   tunnel futures, TLS context, and temporary certificate directory.
-5. Immediately call `os.execv` with the current Python executable,
-   `-m py_frp`, and the original effective CLI arguments.
+4. On the server, broadcast a `server_restarting` control message to every
+   connected control client. Message writes run concurrently and each has a
+   one-second upper bound, so a stalled peer cannot indefinitely block restart.
+5. Close the control listener and connections, public service listeners,
+   pending tunnel futures, TLS context, and temporary certificate directory.
+6. Immediately launch the current Python executable with `-m py_frp` and the
+   original effective CLI arguments.
 
-The `exec` call occurs inside the monitoring coroutine directly after cleanup.
-It does not return through `asyncio.run`, wait for a timer, query the network,
-or ask for confirmation. The working directory and terminal stay attached to
-the replacement process. Standalone entry points such as `py-frps` and
-`py-frpc` are normalized to the equivalent `python -m py_frp server/client`
-form while preserving their arguments.
+There is no delay after cleanup. On Linux and macOS, the POSIX `os.execv` call
+replaces the process in place. On Windows, where `exec` does not provide the
+same reliable terminal-attached replacement semantics, the old process launches
+the replacement with `subprocess.run` in the foreground and exits with its
+return code when it eventually stops. The replacement inherits the same
+terminal, working directory, and environment, and begins while the wrapper is
+waiting. Standalone entry points such as `py-frps` and `py-frpc` are normalized
+to the equivalent `python -m py_frp server/client` form while preserving their
+arguments.
 
 ### Restart-state continuity
 
@@ -134,6 +140,29 @@ connection removes all of that client's public listeners and pending tunnels.
 Recoverable failures cause the client to wait `reconnect_delay` and register
 again. Fatal authentication or unforceable resource-exhaustion responses stop
 the client.
+
+### Coordinated server restart
+
+Immediately before an automatic package-update shutdown, the server sends each
+control client:
+
+```json
+{"type":"server_restarting","reason":"package_update","retry_after":3.0}
+```
+
+The notice is ordered before the server closes client writers. A current client
+treats it as a recoverable, restart-specific disconnect and waits
+`max(reconnect_delay, retry_after)` seconds before opening a new control
+connection. Boolean, non-numeric, non-finite, zero, and negative suggestions
+are ignored, leaving the locally configured reconnect delay in force. This
+means an operator can choose a longer delay, while a server can supply a safe
+minimum for a routine restart.
+
+The server snapshots active control sessions under its state lock, but writes
+the notice outside the lock. Notification failures are isolated per client;
+cleanup and restart continue even if a peer has already vanished or stopped
+reading. An older client may ignore the unknown message, after which server-side
+connection closure still activates that client's ordinary reconnect policy.
 
 ## Port-pool allocation
 
