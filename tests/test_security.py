@@ -38,12 +38,12 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(normalize_fingerprint(pattern), "SHA256:12:34:...:AB")
         self.assertTrue(fingerprints_equal(actual, pattern))
         self.assertTrue(fingerprints_equal(pattern, actual))
+        self.assertTrue(fingerprints_equal(actual, "..."))
         self.assertFalse(fingerprints_equal(actual, "SHA256:12:35:...:AB"))
         self.assertFalse(fingerprints_equal(actual, "SHA256:12:34:...:AC"))
 
     def test_rejects_unsafe_or_malformed_fingerprint_wildcards(self) -> None:
         invalid_patterns = (
-            "SHA256:...",
             "SHA256:AA:...:BB:...:CC",
             "SHA256:A:...:BB",
             "SHA256:GG:...:BB",
@@ -52,6 +52,26 @@ class SecurityTests(unittest.TestCase):
         for pattern in invalid_patterns:
             with self.subTest(pattern=pattern), self.assertRaises(SecurityError):
                 normalize_fingerprint(pattern)
+
+    def test_bare_wildcard_warns_when_client_starts(self) -> None:
+        config = ClientConfig(
+            server_host="example.com",
+            server_port=7000,
+            server_fingerprint="...",
+            proxies=(
+                ProxyConfig(
+                    name="ssh",
+                    local_host="127.0.0.1",
+                    local_port=22,
+                    remote_port=6000,
+                ),
+            ),
+        )
+
+        with self.assertLogs("py_frp.client", level="WARNING") as captured:
+            Client(config)
+
+        self.assertIn("every TLS certificate will match", captured.output[0])
 
     def test_server_tls_fingerprint_survives_restart_state_round_trip(self) -> None:
         with mock.patch.dict(

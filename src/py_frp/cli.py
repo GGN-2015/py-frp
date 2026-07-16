@@ -117,8 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
     client.add_argument(
         "--server-fingerprint",
         help=(
-            "trusted SHA-256 TLS fingerprint; '...' matches whole bytes; "
-            "omit to confirm interactively"
+            "trusted SHA-256 TLS fingerprint; '...' matches whole bytes and "
+            "a bare wildcard warns; omit to confirm interactively"
         ),
     )
     client.add_argument(

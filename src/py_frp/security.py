@@ -205,10 +205,6 @@ def _parse_fingerprint(value: str) -> tuple[bytes, bytes, bool]:
     raw_prefix, raw_suffix = text.split("...", 1)
     prefix = _parse_fingerprint_bytes(raw_prefix)
     suffix = _parse_fingerprint_bytes(raw_suffix)
-    if not prefix and not suffix:
-        raise SecurityError(
-            "server fingerprint wildcard must include at least one fixed byte"
-        )
     if len(prefix) + len(suffix) > 32:
         raise SecurityError(
             "server fingerprint wildcard contains more than 32 fixed bytes"

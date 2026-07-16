@@ -38,10 +38,11 @@ public TCP connection creates a separate TLS tunnel connection.
 Complete fingerprint comparisons normalize case and separators, then compare
 all 32 bytes in constant time. A configured fingerprint may instead contain one
 literal `...`, which matches zero or more complete bytes between an anchored
-prefix and suffix. At least one byte must remain fixed. Fixed portions are also
-compared in constant time; using fewer fixed bytes deliberately weakens the pin.
-A nonmatching certificate aborts the connection before authentication data or
-tunnel traffic is sent.
+prefix and suffix. Fixed portions are also compared in constant time; using
+fewer fixed bytes deliberately weakens the pin. A bare `...` matches every
+fingerprint and logs a startup warning because it disables server identity
+verification. A nonmatching certificate aborts the connection before
+authentication data or tunnel traffic is sent.
 
 ## Installed-package update monitor
 

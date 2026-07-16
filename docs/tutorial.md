@@ -116,6 +116,9 @@ prefix and suffix. This is weaker than a complete pin: use it only when a
 partial pin is an explicit operational requirement. The exact grammar and
 security tradeoff are in the
 [client fingerprint reference](cli-client.md#server-fingerprint-verification).
+The bare value `...` is also accepted, but it matches every certificate and
+causes a startup warning because server identity verification is effectively
+disabled.
 
 ## 5. Choose a preemption policy
 

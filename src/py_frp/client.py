@@ -65,6 +65,11 @@ class Client:
             if configured_fingerprint is not None
             else None
         )
+        if self._trusted_fingerprint == "SHA256:...":
+            LOGGER.warning(
+                "server fingerprint is the bare '...' wildcard; every TLS "
+                "certificate will match and server identity is not verified"
+            )
         # Python 3.9 binds Event construction to a running event loop. Keep it
         # lazy so callers may safely build a Client before asyncio.run().
         self._fingerprint_ready: asyncio.Event | None = None

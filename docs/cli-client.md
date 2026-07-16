@@ -132,15 +132,19 @@ SHA256:12:34:...:70:80
 
 matches the full example above because it begins with `12:34` and ends with
 `70:80`. It does not match a fingerprint with a different prefix or suffix.
-The wildcard may appear at the beginning or end, but the pattern must contain
-at least one fixed byte, may contain only one `...`, and may not specify more
-than 32 fixed bytes.
+The wildcard may appear at the beginning or end. A pattern may contain only one
+`...` and may not specify more than 32 fixed bytes.
 
 A wildcard deliberately verifies fewer bits than a full pin. Every fixed byte
 contributes eight bits; a pattern with only one fixed byte has just 1-in-256
 selectivity and is unsafe against an active attacker. Use the complete
 fingerprint whenever it can be transported reliably. The wildcard exists for
 explicit partial-pin workflows, not as a replacement for certificate trust.
+
+A bare `...` is valid and matches every 32-byte fingerprint. When a client
+starts with that value, it logs a warning that every TLS certificate will match
+and server identity is not verified. This retains encrypted transport but
+provides no protection against connecting to an impersonating TLS server.
 
 Automatic client restart preserves the complete fingerprint accepted during
 an interactive confirmation. It never turns that value into a wildcard and
