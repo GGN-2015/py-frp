@@ -65,9 +65,9 @@ class Client:
             if configured_fingerprint is not None
             else None
         )
-        self._fingerprint_ready = asyncio.Event()
-        if self._trusted_fingerprint is not None:
-            self._fingerprint_ready.set()
+        # Python 3.9 binds Event construction to a running event loop. Keep it
+        # lazy so callers may safely build a Client before asyncio.run().
+        self._fingerprint_ready: asyncio.Event | None = None
 
     def preserve_fingerprint_for_restart(self) -> None:
         if self._trusted_fingerprint is None:
@@ -77,6 +77,10 @@ class Client:
         os.environ[RESTART_SERVER_FINGERPRINT_ENV] = self._trusted_fingerprint
 
     async def wait_until_fingerprint_trusted(self) -> None:
+        if self._trusted_fingerprint is not None:
+            return
+        if self._fingerprint_ready is None:
+            self._fingerprint_ready = asyncio.Event()
         await self._fingerprint_ready.wait()
 
     async def run(self) -> None:
@@ -217,7 +221,8 @@ class Client:
         if not confirmed:
             raise SecurityError("server fingerprint was rejected")
         self._trusted_fingerprint = fingerprint
-        self._fingerprint_ready.set()
+        if self._fingerprint_ready is not None:
+            self._fingerprint_ready.set()
 
     async def _read_control_message(
         self,
