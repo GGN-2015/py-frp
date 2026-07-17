@@ -1,14 +1,12 @@
-from __future__ import annotations
-
 import configparser
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 try:  # pragma: no cover - exercised only on Python < 3.11
-    import tomllib
+    import tomllib  # novermin: guarded by the tomli fallback below
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[no-redef]
 
@@ -22,20 +20,20 @@ class ServerServiceConfig:
     name: str
     bind_host: str
     bind_port: int
-    token: str | None = None
+    token: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class ServerConfig:
     bind_host: str = "0.0.0.0"
     bind_port: int = 7000
-    token: str | None = None
-    services: tuple[ServerServiceConfig, ...] = ()
+    token: Optional[str] = None
+    services: Tuple[ServerServiceConfig, ...] = ()
     allow_dynamic: bool = True
     source_flavor: str = "py-frp"
     open_timeout: float = 15.0
-    port_pool: tuple[int, ...] = ()
-    pool_tokens: tuple[str, ...] = ()
+    port_pool: Tuple[int, ...] = ()
+    pool_tokens: Tuple[str, ...] = ()
     pool_bind_host: str = "0.0.0.0"
 
 
@@ -44,25 +42,25 @@ class ProxyConfig:
     name: str
     local_host: str
     local_port: int
-    remote_host: str | None = None
-    remote_port: int | None = None
-    token: str | None = None
+    remote_host: Optional[str] = None
+    remote_port: Optional[int] = None
+    token: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class ClientConfig:
     server_host: str
     server_port: int
-    proxies: tuple[ProxyConfig, ...]
-    token: str | None = None
+    proxies: Tuple[ProxyConfig, ...]
+    token: Optional[str] = None
     source_flavor: str = "py-frp"
     reconnect_delay: float = 3.0
     connect_timeout: float = 10.0
     heartbeat_interval: float = 30.0
-    server_fingerprint: str | None = None
+    server_fingerprint: Optional[str] = None
 
 
-def load_server_config(path: str | Path) -> ServerConfig:
+def load_server_config(path: Union[str, Path]) -> ServerConfig:
     path = Path(path)
     if path.suffix.lower() in {".ini", ".conf"}:
         return _load_frp_ini_server(path)
@@ -73,7 +71,7 @@ def load_server_config(path: str | Path) -> ServerConfig:
     return _load_frp_or_native_server(data)
 
 
-def load_client_config(path: str | Path) -> ClientConfig:
+def load_client_config(path: Union[str, Path]) -> ClientConfig:
     path = Path(path)
     if path.suffix.lower() in {".ini", ".conf"}:
         return _load_frp_ini_client(path)
@@ -84,7 +82,7 @@ def load_client_config(path: str | Path) -> ClientConfig:
     return _load_frp_or_native_client(data)
 
 
-def privileged_listen_ports(config: ServerConfig) -> tuple[int, ...]:
+def privileged_listen_ports(config: ServerConfig) -> Tuple[int, ...]:
     ports = [config.bind_port]
     ports.extend(service.bind_port for service in config.services)
     ports.extend(config.port_pool)
@@ -107,7 +105,7 @@ def describe_client_config(config: ClientConfig) -> str:
     )
 
 
-def _load_mapping_file(path: Path) -> dict[str, Any]:
+def _load_mapping_file(path: Path) -> Dict[str, Any]:
     suffix = path.suffix.lower()
     try:
         if suffix == ".json":
@@ -204,7 +202,7 @@ def _load_rathole_server(data: Mapping[str, Any]) -> ServerConfig:
     default_token = _string_or_none(_get_any(server, "default_token", "defaultToken"))
     open_timeout = _positive_float(_get_any(server, "open_timeout", "openTimeout"), 15.0)
     services_table = _as_mapping(_get_any(server, "services"), default={})
-    services: list[ServerServiceConfig] = []
+    services: List[ServerServiceConfig] = []
 
     for name, raw_service in services_table.items():
         service = _as_mapping(raw_service)
@@ -246,7 +244,7 @@ def _load_rathole_client(data: Mapping[str, Any]) -> ClientConfig:
         30.0,
     )
     services_table = _as_mapping(_get_any(client, "services"), default={})
-    proxies: list[ProxyConfig] = []
+    proxies: List[ProxyConfig] = []
 
     for name, raw_service in services_table.items():
         service = _as_mapping(raw_service)
@@ -309,7 +307,7 @@ def _load_frp_ini_client(path: Path) -> ClientConfig:
     server_host = common.get("server_addr", "127.0.0.1")
     server_port = _int(common.get("server_port", "7000"), 7000)
     token = _empty_to_none(common.get("token") or common.get("auth_token"))
-    proxies: list[ProxyConfig] = []
+    proxies: List[ProxyConfig] = []
 
     for section in parser.sections():
         if section == "common":
@@ -353,7 +351,7 @@ def _load_frp_ini_client(path: Path) -> ClientConfig:
 
 def _native_server_services(
     root: Mapping[str, Any],
-    default_token: str | None,
+    default_token: Optional[str],
 ) -> Iterable[ServerServiceConfig]:
     services_table = _as_mapping(_get_any(root, "services"), default={})
     for name, raw_service in services_table.items():
@@ -372,7 +370,7 @@ def _native_server_services(
         )
 
 
-def _frp_or_native_proxy(row: Any, default_token: str | None) -> ProxyConfig:
+def _frp_or_native_proxy(row: Any, default_token: Optional[str]) -> ProxyConfig:
     proxy = _as_mapping(row)
     proxy_type = _string(_get_any(proxy, "type"), "tcp").lower()
     if proxy_type != "tcp":
@@ -440,7 +438,10 @@ def _required_mapping(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     return value
 
 
-def _as_mapping(value: Any, default: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+def _as_mapping(
+    value: Any,
+    default: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
     if value is None and default is not None:
         return default
     if not isinstance(value, Mapping):
@@ -474,7 +475,7 @@ def _addr_from_fields(
     addr: Any,
     default_host: str,
     default_port: int,
-) -> tuple[str, int]:
+) -> Tuple[str, int]:
     if addr is None:
         return default_host, default_port
     text = _string(addr)
@@ -483,7 +484,7 @@ def _addr_from_fields(
     return _split_addr(text, default_host=default_host)
 
 
-def _split_addr(value: str, *, default_host: str) -> tuple[str, int]:
+def _split_addr(value: str, *, default_host: str) -> Tuple[str, int]:
     value = value.strip()
     if not value:
         raise ConfigError("address must not be empty")
@@ -530,7 +531,7 @@ def _positive_float(value: Any, default: float) -> float:
     return result
 
 
-def _string(value: Any, default: str | None = None) -> str:
+def _string(value: Any, default: Optional[str] = None) -> str:
     if value is None:
         if default is None:
             raise ConfigError("missing required string value")
@@ -538,13 +539,13 @@ def _string(value: Any, default: str | None = None) -> str:
     return str(value)
 
 
-def _string_or_none(value: Any) -> str | None:
+def _string_or_none(value: Any) -> Optional[str]:
     if value is None:
         return None
     return _empty_to_none(str(value))
 
 
-def _empty_to_none(value: str | None) -> str | None:
+def _empty_to_none(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     value = value.strip()
@@ -559,7 +560,7 @@ def _bool(value: Any, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _auth_token(mapping: Mapping[str, Any]) -> str | None:
+def _auth_token(mapping: Mapping[str, Any]) -> Optional[str]:
     auth = _get_any(mapping, "auth")
     if isinstance(auth, Mapping):
         return _string_or_none(_get_any(auth, "token"))

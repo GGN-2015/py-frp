@@ -71,6 +71,11 @@ parent loop, version validation, retry accounting, signal cleanup, and child
 replacement. `supervisor_ipc.py` owns the generation-tagged private file
 channel. `restart.py` only returns compatibility state and the internal restart
 exit code from child to parent. None of these modules owns tunnel or TLS state.
+`compat.py` contains the narrowly scoped Python 3.6 adapters for top-level event
+loop execution, task creation, blocking-input delegation, running-loop lookup,
+TLS 1.2 minimum selection, and stream-writer shutdown. Keeping them in one
+module prevents version checks from spreading through allocation and relay
+logic.
 
 When the monitor detects a change, it follows this sequence:
 

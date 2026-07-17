@@ -1,14 +1,12 @@
-from __future__ import annotations
-
 import argparse
-import asyncio
 import logging
 import os
 import sys
-from collections.abc import Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 from . import __version__
 from .client import Client
+from .compat import run as run_async
 from .config import (
     ClientConfig,
     ConfigError,
@@ -32,7 +30,7 @@ LOGGER = logging.getLogger(__name__)
 POOL_TOKEN_ENV = "PY_FRP_RESTART_POOL_TOKEN"
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(effective_argv)
@@ -67,11 +65,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 2
 
 
-def server_main(argv: Sequence[str] | None = None) -> int:
+def server_main(argv: Optional[Sequence[str]] = None) -> int:
     return main(["server", *(sys.argv[1:] if argv is None else argv)])
 
 
-def client_main(argv: Sequence[str] | None = None) -> int:
+def client_main(argv: Optional[Sequence[str]] = None) -> int:
     return main(["client", *(sys.argv[1:] if argv is None else argv)])
 
 
@@ -81,7 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="A small Python TCP reverse tunnel.",
     )
     parser.add_argument("--version", action="version", version=f"py-frp {__version__}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
 
     server = subparsers.add_parser("server", aliases=["frps"], help="run the public server")
     _add_runtime_options(server)
@@ -103,11 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="relaunch as administrator/root once before binding ports",
     )
-    server.add_argument(
-        "--auto-elevate",
-        action=argparse.BooleanOptionalAction,
+    _add_boolean_option(
+        server,
+        "auto-elevate",
         default=True,
-        help="auto elevate once when configured listen ports are privileged",
+        help_text="auto elevate once when configured listen ports are privileged",
     )
     server.add_argument("--elevation-attempted", action="store_true", help=argparse.SUPPRESS)
 
@@ -156,11 +155,11 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="logging level",
     )
-    parser.add_argument(
-        "--auto-restart",
-        action=argparse.BooleanOptionalAction,
+    _add_boolean_option(
+        parser,
+        "auto-restart",
         default=True,
-        help="restart the supervised child when the installed package version changes",
+        help_text="restart the supervised child when the installed package version changes",
     )
     parser.add_argument(
         "--update-check-interval",
@@ -180,7 +179,7 @@ def _run_server_command(args: argparse.Namespace, effective_argv: Sequence[str])
     if config.port_pool:
         _print_token_pool(config)
     server = Server(config)
-    return asyncio.run(
+    return run_async(
         _run_server_until_update(
             server,
             auto_restart=args.auto_restart,
@@ -199,7 +198,7 @@ def _run_client_command(args: argparse.Namespace) -> int:
         force_connect=args.force,
         priority=args.priority,
     )
-    return asyncio.run(
+    return run_async(
         _run_client_until_update(
             client,
             auto_restart=args.auto_restart,
@@ -316,13 +315,13 @@ def _load_client_command_config(args: argparse.Namespace) -> ClientConfig:
     )
 
 
-def _split_host_port(value: str, *, default_host: str) -> tuple[str, int]:
+def _split_host_port(value: str, *, default_host: str) -> Tuple[str, int]:
     text = value.strip()
     if text.startswith("["):
         host, separator, port_text = text.rpartition("]:")
         if not separator:
             raise ConfigError(f"address {value!r} must include a port")
-        host = host.removeprefix("[")
+        host = host[1:] if host.startswith("[") else host
     else:
         host, separator, port_text = text.rpartition(":")
         if not separator:
@@ -354,7 +353,7 @@ def _print_token_pool(config: ServerConfig) -> None:
         print(f"token {token}", flush=True)
 
 
-def _print_assigned_ports(message: dict[str, object]) -> None:
+def _print_assigned_ports(message: Dict[str, object]) -> None:
     services = message.get("services")
     if not isinstance(services, list):
         return
@@ -371,3 +370,27 @@ def _configure_logging(level: str) -> None:
         level=getattr(logging, level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+
+def _add_boolean_option(
+    parser: argparse.ArgumentParser,
+    name: str,
+    *,
+    default: bool,
+    help_text: str,
+) -> None:
+    destination = name.replace("-", "_")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--" + name,
+        dest=destination,
+        action="store_true",
+        help=help_text + " (default)",
+    )
+    group.add_argument(
+        "--no-" + name,
+        dest=destination,
+        action="store_false",
+        help="disable " + help_text,
+    )
+    parser.set_defaults(**{destination: default})

@@ -1,13 +1,11 @@
-from __future__ import annotations
-
 import asyncio
 import logging
 import math
 import os
 import time
-from collections.abc import Callable
-from typing import Any
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from .compat import create_task, to_thread
 from .config import ClientConfig
 from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
 from .security import (
@@ -39,9 +37,9 @@ class Client:
     def __init__(
         self,
         config: ClientConfig,
-        on_registered: Callable[[dict[str, Any]], None] | None = None,
-        confirm_fingerprint: Callable[[str], bool] | None = None,
-        confirm_force: Callable[[str], bool] | None = None,
+        on_registered: Optional[Callable[[Dict[str, Any]], None]] = None,
+        confirm_fingerprint: Optional[Callable[[str], bool]] = None,
+        confirm_force: Optional[Callable[[str], bool]] = None,
         force_connect: bool = False,
         priority: int = 0,
     ):
@@ -53,7 +51,7 @@ class Client:
         self.priority = priority
         self._base_proxies = {proxy.name: proxy for proxy in config.proxies}
         self._proxies = dict(self._base_proxies)
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._tasks: Set[asyncio.Task] = set()
         self._tls_context = create_client_tls_context()
         configured_fingerprint = (
             config.server_fingerprint
@@ -70,9 +68,9 @@ class Client:
                 "server fingerprint is the bare '...' wildcard; every TLS "
                 "certificate will match and server identity is not verified"
             )
-        # Python 3.9 binds Event construction to a running event loop. Keep it
-        # lazy so callers may safely build a Client before asyncio.run().
-        self._fingerprint_ready: asyncio.Event | None = None
+        # Keep this lazy so callers on every supported Python can construct a
+        # Client before the runtime event loop exists.
+        self._fingerprint_ready: Optional[asyncio.Event] = None
 
     def preserve_fingerprint_for_restart(self) -> None:
         if self._trusted_fingerprint is None:
@@ -121,7 +119,7 @@ class Client:
 
     async def _run_once(self) -> None:
         reader, writer = await self._open_server_connection()
-        heartbeat_task: asyncio.Task[None] | None = None
+        heartbeat_task: Optional[asyncio.Task] = None
         try:
             await write_message(writer, {"type": "hello", "version": 2, "client": "py-frp"})
             hello = await read_message(reader)
@@ -129,7 +127,7 @@ class Client:
                 raise ProtocolError("server closed during hello")
             _raise_error_response(hello)
 
-            register_message: dict[str, Any] = {
+            register_message: Dict[str, Any] = {
                 "type": "register",
                 "services": self._service_payloads(),
             }
@@ -158,14 +156,14 @@ class Client:
             LOGGER.info("registered %d service(s)", len(self.config.proxies))
             if self.on_registered is not None:
                 self.on_registered(registered)
-            heartbeat_task = asyncio.create_task(self._heartbeat(writer))
+            heartbeat_task = create_task(self._heartbeat(writer))
 
             while True:
                 message = await self._read_control_message(reader, heartbeat_task)
                 if message is None:
                     raise ConnectionError("control connection closed")
                 if message.get("type") == "open":
-                    task = asyncio.create_task(self._open_tunnel(message))
+                    task = create_task(self._open_tunnel(message))
                     self._track_tunnel_task(task)
                 elif message.get("type") == "pong":
                     LOGGER.debug("received pong")
@@ -185,7 +183,7 @@ class Client:
 
     async def _open_server_connection(
         self,
-    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
                 self.config.server_host,
@@ -213,7 +211,7 @@ class Client:
         if self.confirm_fingerprint is None:
             print(f"server_tls_fingerprint {fingerprint}", flush=True)
             try:
-                answer = await asyncio.to_thread(
+                answer = await to_thread(
                     input,
                     "Trust this server fingerprint? [y/N]: ",
                 )
@@ -232,9 +230,9 @@ class Client:
     async def _read_control_message(
         self,
         reader: asyncio.StreamReader,
-        heartbeat_task: asyncio.Task[None],
-    ) -> dict[str, Any] | None:
-        read_task = asyncio.create_task(read_message(reader))
+        heartbeat_task: asyncio.Task,
+    ) -> Optional[Dict[str, Any]]:
+        read_task = create_task(read_message(reader))
         try:
             done, _ = await asyncio.wait(
                 {read_task, heartbeat_task},
@@ -263,7 +261,7 @@ class Client:
             return bool(self.confirm_force(reason))
         print(reason, flush=True)
         try:
-            answer = await asyncio.to_thread(
+            answer = await to_thread(
                 input,
                 "Force connection and disconnect an eligible equal-or-lower-priority pool client? [y/N]: ",
             )
@@ -271,10 +269,10 @@ class Client:
             return False
         return answer.strip().lower() in {"y", "yes"}
 
-    def _service_payloads(self) -> list[dict[str, Any]]:
-        payloads: list[dict[str, Any]] = []
+    def _service_payloads(self) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
         for proxy in self.config.proxies:
-            payload: dict[str, Any] = {
+            payload: Dict[str, Any] = {
                 "name": proxy.name,
                 "token": proxy.token or self.config.token,
             }
@@ -287,7 +285,7 @@ class Client:
             payloads.append(payload)
         return payloads
 
-    def _apply_registered_aliases(self, message: dict[str, Any]) -> None:
+    def _apply_registered_aliases(self, message: Dict[str, Any]) -> None:
         self._proxies = dict(self._base_proxies)
         services = message.get("services")
         if not isinstance(services, list) or len(services) != len(self.config.proxies):
@@ -299,7 +297,7 @@ class Client:
             if isinstance(name, str) and name:
                 self._proxies[name] = proxy
 
-    async def _open_tunnel(self, message: dict[str, Any]) -> None:
+    async def _open_tunnel(self, message: Dict[str, Any]) -> None:
         tunnel_id = str(message.get("id") or "")
         service_name = str(message.get("service") or "")
         proxy = self._proxies.get(service_name)
@@ -307,10 +305,10 @@ class Client:
             LOGGER.warning("received open for unknown service %r", service_name)
             return
 
-        local_reader: asyncio.StreamReader | None = None
-        local_writer: asyncio.StreamWriter | None = None
-        tunnel_writer: asyncio.StreamWriter | None = None
-        local_error: str | None = None
+        local_reader: Optional[asyncio.StreamReader] = None
+        local_writer: Optional[asyncio.StreamWriter] = None
+        tunnel_writer: Optional[asyncio.StreamWriter] = None
+        local_error: Optional[str] = None
         try:
             try:
                 local_reader, local_writer = await asyncio.wait_for(
@@ -347,11 +345,11 @@ class Client:
             await close_writer(local_writer)
             await close_writer(tunnel_writer)
 
-    def _track_tunnel_task(self, task: asyncio.Task[None]) -> None:
+    def _track_tunnel_task(self, task: asyncio.Task) -> None:
         self._tasks.add(task)
         task.add_done_callback(self._on_tunnel_task_done)
 
-    def _on_tunnel_task_done(self, task: asyncio.Task[None]) -> None:
+    def _on_tunnel_task_done(self, task: asyncio.Task) -> None:
         self._tasks.discard(task)
         try:
             task.result()
@@ -368,13 +366,13 @@ class Client:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _message_error(message: dict[str, Any] | None, default: str) -> str:
+def _message_error(message: Optional[Dict[str, Any]], default: str) -> str:
     if isinstance(message, dict) and message.get("error"):
         return str(message["error"])
     return default
 
 
-def _raise_error_response(message: dict[str, Any]) -> None:
+def _raise_error_response(message: Dict[str, Any]) -> None:
     if message.get("type") != "error":
         return
     error = _message_error(message, "server error")
@@ -383,7 +381,7 @@ def _raise_error_response(message: dict[str, Any]) -> None:
     raise ProtocolError(error)
 
 
-def _server_restart_delay(message: dict[str, Any], reconnect_delay: float) -> float:
+def _server_restart_delay(message: Dict[str, Any], reconnect_delay: float) -> float:
     raw_delay = message.get("retry_after")
     if isinstance(raw_delay, bool):
         return reconnect_delay

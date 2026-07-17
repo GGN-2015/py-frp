@@ -1,7 +1,10 @@
 # py-frp
 
 A small Python TCP reverse tunnel for exposing a service behind NAT through a
-public server.
+public server. Python 3.6 and every later Python 3 release are supported.
+Legacy Python releases and their compatible dependency lines may no longer be
+maintained upstream; use a current Python release for security-sensitive
+deployments.
 
 ## Quick Start
 

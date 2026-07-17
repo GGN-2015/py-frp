@@ -1,17 +1,19 @@
-from __future__ import annotations
-
 import asyncio
 import logging
 import os
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from importlib import metadata
 from pathlib import Path
-from typing import TypeVar
+from typing import Awaitable, Callable, List, Optional, Set, Tuple, TypeVar
+
+try:
+    from importlib import metadata  # novermin: guarded by the backport below
+except ImportError:  # pragma: no cover - Python 3.6 and 3.7
+    import importlib_metadata as metadata
 
 from packaging.version import InvalidVersion, Version
 
 from . import __version__
+from .compat import create_task
 from .restart import RESTART_TARGET_VERSION_ENV
 from .supervisor_ipc import is_supervised_child, supervisor_restart_target
 
@@ -30,12 +32,12 @@ class VersionChange:
     current: str
 
 
-def installed_version() -> str | None:
+def installed_version() -> Optional[str]:
     try:
         distributions = metadata.distributions(name=DISTRIBUTION_NAME)
     except OSError:
         return None
-    candidates: set[str] = set()
+    candidates: Set[str] = set()
     for distribution in distributions:
         try:
             candidate_directory = Path(distribution.locate_file("py_frp")).resolve()
@@ -46,7 +48,7 @@ def installed_version() -> str | None:
         ):
             continue
         candidates.add(distribution.version)
-    parsed: list[tuple[Version, str]] = []
+    parsed: List[Tuple[Version, str]] = []
     for candidate in candidates:
         try:
             parsed.append((Version(candidate), candidate))
@@ -59,9 +61,9 @@ def installed_version() -> str | None:
 
 async def wait_for_version_change(
     *,
-    initial_version: str | None = None,
+    initial_version: Optional[str] = None,
     interval: float = UPDATE_CHECK_INTERVAL,
-    version_reader: Callable[[], str | None] = installed_version,
+    version_reader: Callable[[], Optional[str]] = installed_version,
 ) -> VersionChange:
     if interval <= 0:
         raise ValueError("update check interval must be greater than zero")
@@ -83,13 +85,13 @@ async def wait_for_version_change(
 async def run_until_version_change(
     runtime: Awaitable[T],
     *,
-    initial_version: str | None = None,
+    initial_version: Optional[str] = None,
     interval: float = UPDATE_CHECK_INTERVAL,
-    version_reader: Callable[[], str | None] = installed_version,
-    restart_ready: Callable[[], Awaitable[None]] | None = None,
-) -> tuple[T | None, VersionChange | None]:
+    version_reader: Callable[[], Optional[str]] = installed_version,
+    restart_ready: Optional[Callable[[], Awaitable[None]]] = None,
+) -> Tuple[Optional[T], Optional[VersionChange]]:
     runtime_task = asyncio.ensure_future(runtime)
-    update_task = asyncio.create_task(
+    update_task = create_task(
         _wait_until_restart_ready(
             initial_version=initial_version,
             interval=interval,
@@ -124,10 +126,10 @@ async def run_until_version_change(
 
 async def _wait_until_restart_ready(
     *,
-    initial_version: str | None,
+    initial_version: Optional[str],
     interval: float,
-    version_reader: Callable[[], str | None],
-    restart_ready: Callable[[], Awaitable[None]] | None,
+    version_reader: Callable[[], Optional[str]],
+    restart_ready: Optional[Callable[[], Awaitable[None]]],
 ) -> VersionChange:
     change = await wait_for_version_change(
         initial_version=initial_version,
@@ -139,7 +141,7 @@ async def _wait_until_restart_ready(
     return change
 
 
-def _failed_restart_target(loaded_version: str) -> str | None:
+def _failed_restart_target(loaded_version: str) -> Optional[str]:
     target = os.environ.get(RESTART_TARGET_VERSION_ENV)
     if not target:
         return None

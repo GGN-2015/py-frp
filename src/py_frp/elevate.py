@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 import os
 import platform
 import sys
-from collections.abc import Sequence
+from typing import Sequence
 
 from .config import ServerConfig, privileged_listen_ports
 

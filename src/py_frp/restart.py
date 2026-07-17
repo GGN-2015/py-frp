@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import logging
 import os
-from collections.abc import Sequence
+from typing import Optional, Sequence
 
 from .supervisor_ipc import (
     CHILD_RESTART_EXIT_CODE,
@@ -27,7 +25,7 @@ def request_restart(expected_version: str) -> None:
 def restart_current_command(
     argv: Sequence[str],
     *,
-    expected_version: str | None = None,
+    expected_version: Optional[str] = None,
 ) -> None:
     """Compatibility wrapper for callers of the pre-supervisor restart API."""
     del argv

@@ -1,11 +1,10 @@
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
 import struct
-from collections.abc import Mapping
-from typing import Any
+from typing import Any, Dict, Mapping, Optional
+
+from .compat import create_task
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,7 +18,7 @@ class ProtocolError(RuntimeError):
     """Raised when a peer sends an invalid protocol message."""
 
 
-async def read_message(reader: asyncio.StreamReader) -> dict[str, Any] | None:
+async def read_message(reader: asyncio.StreamReader) -> Optional[Dict[str, Any]]:
     line = await reader.readline()
     if not line:
         return None
@@ -49,12 +48,18 @@ async def write_message(
     await writer.drain()
 
 
-async def close_writer(writer: asyncio.StreamWriter | None) -> None:
-    if writer is None or writer.is_closing():
+async def close_writer(writer: Optional[asyncio.StreamWriter]) -> None:
+    if writer is None:
+        return
+    is_closing = getattr(writer, "is_closing", None)
+    if is_closing is not None and is_closing():
         return
     writer.close()
+    wait_closed = getattr(writer, "wait_closed", None)
+    if wait_closed is None:
+        return
     try:
-        await writer.wait_closed()
+        await wait_closed()
     except (ConnectionError, OSError):
         pass
 
@@ -65,8 +70,8 @@ async def pipe_streams(
     right_reader: asyncio.StreamReader,
     right_writer: asyncio.StreamWriter,
 ) -> None:
-    left_to_right = asyncio.create_task(_copy_stream(left_reader, right_writer))
-    right_to_left = asyncio.create_task(_copy_stream(right_reader, left_writer))
+    left_to_right = create_task(_copy_stream(left_reader, right_writer))
+    right_to_left = create_task(_copy_stream(right_reader, left_writer))
     pending = {left_to_right, right_to_left}
     cancel_remaining = False
 
@@ -109,8 +114,8 @@ async def pipe_tunnel_streams(
     tunnel_reader: asyncio.StreamReader,
     tunnel_writer: asyncio.StreamWriter,
 ) -> None:
-    to_tunnel = asyncio.create_task(_copy_to_tunnel(plain_reader, tunnel_writer))
-    from_tunnel = asyncio.create_task(_copy_from_tunnel(tunnel_reader, plain_writer))
+    to_tunnel = create_task(_copy_to_tunnel(plain_reader, tunnel_writer))
+    from_tunnel = create_task(_copy_from_tunnel(tunnel_reader, plain_writer))
     pending = {to_tunnel, from_tunnel}
     cancel_remaining = False
 

@@ -29,3 +29,38 @@ jobs:
         run: python -m unittest discover -s tests
       - name: Exercise installed CLI entry point
         run: py-frp --version
+
+  python36-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.6"
+          architecture: x64
+      - name: Install package
+        run: python -m pip install .
+      - name: Run Python 3.6 end-to-end tests
+        run: python tests/test_python36.py
+      - name: Exercise installed CLI entry point
+        run: py-frp --version
+
+  legacy-linux:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.6", "3.7", "3.8"]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test in official legacy Python container
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace"
+          --workdir /workspace
+          python:${{ matrix.python-version }}
+          bash -c "python -m pip install . && python tests/test_python36.py && py-frp --version"

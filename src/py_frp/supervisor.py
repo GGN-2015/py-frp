@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 import os
 import signal
@@ -11,7 +9,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Deque, Dict, Iterator, List, Optional
 
 from .supervisor_ipc import (
     CHILD_RESTART_EXIT_CODE,
@@ -37,8 +35,8 @@ SUPERVISOR_POLL_INTERVAL = 0.1
 
 @dataclass(frozen=True)
 class LaunchResult:
-    status: ChildStatus | None
-    returncode: int | None
+    status: Optional[ChildStatus]
+    returncode: Optional[int]
 
     @property
     def stable(self) -> bool:
@@ -47,8 +45,8 @@ class LaunchResult:
 
 @dataclass(frozen=True)
 class MonitorResult:
-    returncode: int | None = None
-    restart_target: str | None = None
+    returncode: Optional[int] = None
+    restart_target: Optional[str] = None
 
 
 class ProcessSupervisor:
@@ -56,7 +54,7 @@ class ProcessSupervisor:
 
     def __init__(
         self,
-        argv: list[str],
+        argv: List[str],
         *,
         auto_restart: bool,
         update_interval: float,
@@ -69,9 +67,9 @@ class ProcessSupervisor:
         self.update_interval = update_interval
         self.environment = clear_internal_environment(os.environ.copy())
         self.environment.pop(f"{RESTART_ENV_PREFIX}TARGET_VERSION", None)
-        self.failures: dict[str, deque[float]] = defaultdict(deque)
-        self.suppressed_target: str | None = None
-        self.child: subprocess.Popen[bytes] | None = None
+        self.failures: Dict[str, Deque[float]] = defaultdict(deque)
+        self.suppressed_target: Optional[str] = None
+        self.child: Optional[subprocess.Popen] = None
 
     def run(self) -> int:
         with _windows_break_as_keyboard_interrupt():
@@ -90,7 +88,7 @@ class ProcessSupervisor:
                 return 130
 
     def _run_children(self, channel: SupervisorChannel) -> int:
-        target: str | None = None
+        target: Optional[str] = None
         while True:
             generation = uuid.uuid4().hex
             launch = self._launch_child(channel, generation)
@@ -181,7 +179,7 @@ class ProcessSupervisor:
     ) -> MonitorResult:
         assert self.child is not None
         next_check = 0.0
-        requested_target: str | None = None
+        requested_target: Optional[str] = None
         while True:
             try:
                 returncode = self.child.wait(timeout=SUPERVISOR_POLL_INTERVAL)
@@ -292,7 +290,7 @@ class ProcessSupervisor:
 
 
 def run_supervisor(
-    argv: list[str],
+    argv: List[str],
     *,
     auto_restart: bool,
     update_interval: float,

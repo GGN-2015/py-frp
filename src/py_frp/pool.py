@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 import hashlib
 import secrets
 import string
-from collections.abc import Iterable
+from typing import Iterable, List, Set, Tuple
 
 from .config import ConfigError
 
@@ -13,24 +11,24 @@ TOKEN_ALPHABET = "".join(
 )
 
 
-def generate_tokens(count: int, *, length: int = 24) -> tuple[str, ...]:
+def generate_tokens(count: int, *, length: int = 24) -> Tuple[str, ...]:
     if count <= 0:
         raise ConfigError("token count must be greater than zero")
     if length <= 0:
         raise ConfigError("token length must be greater than zero")
-    tokens: set[str] = set()
+    tokens: Set[str] = set()
     while len(tokens) < count:
         tokens.add("".join(secrets.choice(TOKEN_ALPHABET) for _ in range(length)))
     return tuple(tokens)
 
 
-def parse_port_pool(value: str) -> tuple[int, ...]:
+def parse_port_pool(value: str) -> Tuple[int, ...]:
     return parse_port_pools((value,))
 
 
-def parse_port_pools(values: Iterable[str]) -> tuple[int, ...]:
-    ports: list[int] = []
-    seen: set[int] = set()
+def parse_port_pools(values: Iterable[str]) -> Tuple[int, ...]:
+    ports: List[int] = []
+    seen: Set[int] = set()
     for value in values:
         for part in value.split(","):
             item = part.strip()

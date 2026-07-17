@@ -1,13 +1,12 @@
-from __future__ import annotations
-
 import asyncio
 import logging
 import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
+from .compat import get_running_loop
 from .config import ServerConfig, ServerServiceConfig
 from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
 from .security import ServerTLS, create_server_tls
@@ -48,7 +47,7 @@ class ClientSession:
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     created_at: float = field(default_factory=time.monotonic)
 
-    async def send(self, message: dict[str, Any]) -> None:
+    async def send(self, message: Dict[str, Any]) -> None:
         async with self.write_lock:
             await write_message(self.writer, message)
 
@@ -58,15 +57,15 @@ class RegisteredService:
     name: str
     bind_host: str
     bind_port: int
-    token: str | None
+    token: Optional[str]
     client: ClientSession
     listener: asyncio.AbstractServer
     configured: bool
-    pool_token: str | None = None
+    pool_token: Optional[str] = None
     priority: int = 0
 
     @property
-    def public_address(self) -> tuple[str, int]:
+    def public_address(self) -> Tuple[str, int]:
         sockets = self.listener.sockets or ()
         if sockets:
             host, port, *_ = sockets[0].getsockname()
@@ -78,9 +77,9 @@ class RegisteredService:
 class PendingTunnel:
     id: str
     service_name: str
-    token: str | None
+    token: Optional[str]
     client: ClientSession
-    future: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]]
+    future: asyncio.Future
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -89,12 +88,12 @@ class Server:
         self.config = config
         self._configured = {service.name: service for service in config.services}
         self._pool_tokens = set(config.pool_tokens)
-        self._services: dict[str, RegisteredService] = {}
-        self._pending: dict[str, PendingTunnel] = {}
-        self._clients: dict[str, ClientSession] = {}
+        self._services: Dict[str, RegisteredService] = {}
+        self._pending: Dict[str, PendingTunnel] = {}
+        self._clients: Dict[str, ClientSession] = {}
         self._lock = asyncio.Lock()
-        self._server: asyncio.AbstractServer | None = None
-        self._tls: ServerTLS | None = None
+        self._server: Optional[asyncio.AbstractServer] = None
+        self._tls: Optional[ServerTLS] = None
 
     async def start(self) -> None:
         if self._server is not None:
@@ -117,6 +116,9 @@ class Server:
     async def serve_forever(self) -> None:
         await self.start()
         assert self._server is not None
+        if not hasattr(self._server, "serve_forever"):
+            await asyncio.Future()
+            return
         async with self._server:
             await self._server.serve_forever()
 
@@ -171,14 +173,14 @@ class Server:
     async def _notify_restarting_client(
         self,
         client: ClientSession,
-        message: dict[str, Any],
+        message: Dict[str, Any],
     ) -> None:
         try:
             await asyncio.wait_for(client.send(message), timeout=1.0)
         except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError):
             LOGGER.debug("could not notify restarting client %s", client.id)
 
-    def control_addresses(self) -> tuple[tuple[str, int], ...]:
+    def control_addresses(self) -> Tuple[Tuple[str, int], ...]:
         if self._server is None or self._server.sockets is None:
             return ()
         return tuple((str(sock.getsockname()[0]), int(sock.getsockname()[1])) for sock in self._server.sockets)
@@ -194,11 +196,11 @@ class Server:
             raise RuntimeError("server has not been started")
         self._tls.preserve_for_restart()
 
-    def service_address(self, name: str) -> tuple[str, int] | None:
+    def service_address(self, name: str) -> Optional[Tuple[str, int]]:
         service = self._services.get(name)
         return None if service is None else service.public_address
 
-    async def online_pool_clients(self) -> dict[str, tuple[str, int]]:
+    async def online_pool_clients(self) -> Dict[str, Tuple[str, int]]:
         async with self._lock:
             return {
                 service.name: service.public_address
@@ -221,6 +223,8 @@ class Server:
                 await self._handle_tunnel(first, reader, writer)
                 return
             await self._handle_control(first, reader, writer)
+        except asyncio.CancelledError:
+            raise
         except (ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.debug("connection rejected: %s", exc)
             await _best_effort_error(writer, str(exc), fatal=isinstance(exc, AuthenticationError))
@@ -232,7 +236,7 @@ class Server:
 
     async def _handle_control(
         self,
-        first: dict[str, Any],
+        first: Dict[str, Any],
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
@@ -303,6 +307,8 @@ class Server:
                     break
                 else:
                     LOGGER.debug("ignored control message from %s: %s", client.id, message)
+        except asyncio.CancelledError:
+            raise
         except (ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.warning("client %s disconnected: %s", client.id, exc)
             await _best_effort_error(
@@ -326,11 +332,11 @@ class Server:
         raw_services: Any,
         *,
         force: bool = False,
-    ) -> list[RegisteredService]:
+    ) -> List[RegisteredService]:
         if not isinstance(raw_services, list) or not raw_services:
             raise ProtocolError("register message must include services")
 
-        registered: list[RegisteredService] = []
+        registered: List[RegisteredService] = []
         try:
             for raw in raw_services:
                 if self._is_pool_registration(raw):
@@ -396,11 +402,11 @@ class Server:
         priority = _priority(raw.get("priority", 0))
 
         service_name = _pool_service_name(client)
-        victim: ClientSession | None = None
-        victim_services: list[RegisteredService] = []
-        victim_pending: list[PendingTunnel] = []
-        registered_service: RegisteredService | None = None
-        last_error: OSError | None = None
+        victim: Optional[ClientSession] = None
+        victim_services: List[RegisteredService] = []
+        victim_pending: List[PendingTunnel] = []
+        registered_service: Optional[RegisteredService] = None
+        last_error: Optional[OSError] = None
 
         async with self._lock:
             registered_service, last_error = await self._bind_pool_service_locked(
@@ -500,13 +506,13 @@ class Server:
         service_name: str,
         token: str,
         priority: int,
-    ) -> tuple[RegisteredService | None, OSError | None]:
+    ) -> Tuple[Optional[RegisteredService], Optional[OSError]]:
         used_ports = {
             service.bind_port
             for service in self._services.values()
             if service.pool_token is not None
         }
-        last_error: OSError | None = None
+        last_error: Optional[OSError] = None
         for port in sorted(self.config.port_pool):
             if port in used_ports:
                 continue
@@ -619,8 +625,8 @@ class Server:
             return
 
         tunnel_id = secrets.token_urlsafe(24)
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = loop.create_future()
+        loop = get_running_loop()
+        future = loop.create_future()
         pending = PendingTunnel(
             id=tunnel_id,
             service_name=service_name,
@@ -631,7 +637,7 @@ class Server:
         async with self._lock:
             self._pending[tunnel_id] = pending
 
-        tunnel_writer: asyncio.StreamWriter | None = None
+        tunnel_writer: Optional[asyncio.StreamWriter] = None
         try:
             await service.client.send(
                 {
@@ -645,6 +651,8 @@ class Server:
                 timeout=self.config.open_timeout,
             )
             await pipe_tunnel_streams(reader, writer, tunnel_reader, tunnel_writer)
+        except asyncio.CancelledError:
+            raise
         except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError) as exc:
             LOGGER.debug("public connection for %s closed: %s", service_name, exc)
         except Exception:
@@ -660,7 +668,7 @@ class Server:
 
     async def _handle_tunnel(
         self,
-        message: dict[str, Any],
+        message: Dict[str, Any],
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
@@ -689,12 +697,13 @@ async def _best_effort_error(
     error: str,
     *,
     fatal: bool = False,
-    max_priority: int | None = None,
+    max_priority: Optional[int] = None,
 ) -> None:
-    if writer.is_closing():
+    is_closing = getattr(writer, "is_closing", None)
+    if is_closing is not None and is_closing():
         return
     try:
-        message: dict[str, Any] = {"type": "error", "error": error, "fatal": fatal}
+        message: Dict[str, Any] = {"type": "error", "error": error, "fatal": fatal}
         if max_priority is not None:
             message["max_priority"] = max_priority
         await write_message(writer, message)
@@ -702,12 +711,12 @@ async def _best_effort_error(
         pass
 
 
-def _require_token(expected: str | None, provided: str | None) -> None:
+def _require_token(expected: Optional[str], provided: Optional[str]) -> None:
     if expected is not None and provided != expected:
         raise AuthenticationError("authentication failed")
 
 
-def _optional_string(value: Any) -> str | None:
+def _optional_string(value: Any) -> Optional[str]:
     if value is None:
         return None
     text = str(value)
@@ -739,7 +748,7 @@ def _pool_service_name(client: ClientSession) -> str:
     return f"pool-{client.id}"
 
 
-def _resource_exhausted(cause: OSError | None) -> ResourceExhaustedError:
+def _resource_exhausted(cause: Optional[OSError]) -> ResourceExhaustedError:
     error = ResourceExhaustedError(
         "resource insufficient: no available port in the configured pool"
     )

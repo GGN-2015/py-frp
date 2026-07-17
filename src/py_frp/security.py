@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import base64
 import binascii
 import datetime as dt
@@ -9,14 +7,25 @@ import ipaddress
 import os
 import re
 import ssl
+import sys
 import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional, Tuple
 
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+if sys.version_info < (3, 7):
+    warnings.filterwarnings(
+        "ignore",
+        message="Python 3.6 is no longer supported by the Python core team.*",
+    )
+
+from cryptography import x509  # noqa: E402
+from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
+from cryptography.x509.oid import NameOID  # noqa: E402
+
+from .compat import require_tls12
 
 
 class SecurityError(RuntimeError):
@@ -32,7 +41,7 @@ RESTART_SERVER_FINGERPRINT_ENV = "PY_FRP_RESTART_SERVER_FINGERPRINT"
 class ServerTLS:
     context: ssl.SSLContext
     fingerprint: str
-    _directory: tempfile.TemporaryDirectory[str]
+    _directory: tempfile.TemporaryDirectory
     _certificate_pem: bytes
     _private_key_pem: bytes
 
@@ -63,7 +72,7 @@ def create_server_tls(bind_host: str) -> ServerTLS:
     key_path.write_bytes(private_key_pem)
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    require_tls12(context)
     try:
         context.load_cert_chain(certfile=cert_path, keyfile=key_path)
     except (OSError, ssl.SSLError) as exc:
@@ -79,13 +88,13 @@ def create_server_tls(bind_host: str) -> ServerTLS:
     )
 
 
-def _generate_tls_material(bind_host: str) -> tuple[bytes, bytes]:
+def _generate_tls_material(bind_host: str) -> Tuple[bytes, bytes]:
     private_key = ec.generate_private_key(ec.SECP256R1())
     subject = issuer = x509.Name(
         [x509.NameAttribute(NameOID.COMMON_NAME, "py-frp ephemeral server")]
     )
     now = dt.datetime.now(dt.timezone.utc)
-    alternative_names: list[x509.GeneralName] = [x509.DNSName("localhost")]
+    alternative_names: List[x509.GeneralName] = [x509.DNSName("localhost")]
     try:
         if bind_host not in {"0.0.0.0", "::", ""}:
             alternative_names.append(x509.IPAddress(ipaddress.ip_address(bind_host)))
@@ -114,7 +123,7 @@ def _generate_tls_material(bind_host: str) -> tuple[bytes, bytes]:
     )
 
 
-def _restored_tls_material() -> tuple[bytes, bytes] | None:
+def _restored_tls_material() -> Optional[Tuple[bytes, bytes]]:
     certificate = os.environ.get(RESTART_CERT_ENV)
     private_key = os.environ.get(RESTART_KEY_ENV)
     if not certificate and not private_key:
@@ -132,7 +141,7 @@ def _restored_tls_material() -> tuple[bytes, bytes] | None:
 
 def create_client_tls_context() -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    require_tls12(context)
     # The ephemeral certificate is authenticated by an explicit SHA-256 pin.
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
@@ -187,7 +196,7 @@ def fingerprints_equal(left: str, right: str) -> bool:
     return hmac.compare_digest(left_prefix, right_prefix)
 
 
-def _parse_fingerprint(value: str) -> tuple[bytes, bytes, bool]:
+def _parse_fingerprint(value: str) -> Tuple[bytes, bytes, bool]:
     text = value.strip().upper()
     if text.startswith("SHA256:"):
         text = text[7:]

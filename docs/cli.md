@@ -10,6 +10,16 @@ options that do not apply to them.
 pip install py-simple-nat-tunnel
 ```
 
+Python 3.6 and every later Python 3 release are supported. On Python 3.6, pip
+selects fixed, tested compatibility releases of cryptography, packaging, TOML
+parsing, dataclasses, and importlib metadata automatically. Newer interpreters
+continue to use current dependency lines.
+
+Legacy Python releases and the compatible dependencies available to their pip
+may be end-of-life upstream. They remain installable and tested here, but a
+current Python release is strongly recommended for any internet-facing or
+otherwise security-sensitive deployment.
+
 For development from a checkout, use `pip install -e .`. Check the active
 installation with:
 

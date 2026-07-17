@@ -90,6 +90,12 @@ fallbacks if needed. Further console interrupts are ignored during that short
 forced-cleanup section so they cannot strand the child. The supervisor returns
 status 130 after the child is gone.
 
+The same lifecycle is supported from Python 3.6 onward. A small internal
+compatibility module maps missing Python 3.6 asyncio operations to their older
+event-loop equivalents, provides the pre-3.7 TLS-minimum configuration, and
+normalizes writer shutdown. These branches do not change the tunnel protocol or
+the supervisor's one-parent/one-child invariant.
+
 ## Restart-loop protection
 
 The supervisor carries the target version into the replacement and requires

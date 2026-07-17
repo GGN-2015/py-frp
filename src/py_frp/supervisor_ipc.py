@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import json
 import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional, Tuple
 
 
 SUPERVISED_CHILD_ENV = "PY_FRP_SUPERVISED_CHILD"
@@ -25,7 +23,7 @@ class ChildStatus:
 @dataclass(frozen=True)
 class RestartState:
     target_version: str
-    environment: dict[str, str]
+    environment: Dict[str, str]
 
 
 class SupervisorChannel:
@@ -39,18 +37,18 @@ class SupervisorChannel:
 
     def prepare_child_environment(
         self,
-        base_environment: dict[str, str],
+        base_environment: Dict[str, str],
         generation: str,
-    ) -> dict[str, str]:
+    ) -> Dict[str, str]:
         for path in (self.status_path, self.command_path, self.restart_state_path):
-            path.unlink(missing_ok=True)
+            _unlink_if_present(path)
         environment = base_environment.copy()
         environment[SUPERVISED_CHILD_ENV] = "1"
         environment[SUPERVISOR_ROOT_ENV] = str(self.root)
         environment[SUPERVISOR_GENERATION_ENV] = generation
         return environment
 
-    def child_status(self, generation: str) -> ChildStatus | None:
+    def child_status(self, generation: str) -> Optional[ChildStatus]:
         payload = _read_json(self.status_path)
         if payload is None or payload.get("generation") != generation:
             return None
@@ -70,7 +68,7 @@ class SupervisorChannel:
             },
         )
 
-    def restart_state(self, generation: str) -> RestartState | None:
+    def restart_state(self, generation: str) -> Optional[RestartState]:
         payload = _read_json(self.restart_state_path)
         if payload is None or payload.get("generation") != generation:
             return None
@@ -88,7 +86,7 @@ class SupervisorChannel:
         return RestartState(target_version=target, environment=environment)
 
 
-def create_supervisor_directory() -> tempfile.TemporaryDirectory[str]:
+def create_supervisor_directory() -> tempfile.TemporaryDirectory:
     return tempfile.TemporaryDirectory(prefix="py-frp-supervisor-")
 
 
@@ -115,7 +113,7 @@ def publish_child_status(version: str) -> None:
     )
 
 
-def supervisor_restart_target() -> str | None:
+def supervisor_restart_target() -> Optional[str]:
     channel = _child_channel()
     if channel is None:
         return None
@@ -152,7 +150,7 @@ def publish_restart_state(target_version: str) -> bool:
     return True
 
 
-def clear_internal_environment(environment: dict[str, str]) -> dict[str, str]:
+def clear_internal_environment(environment: Dict[str, str]) -> Dict[str, str]:
     """Remove an inherited child channel before creating a new supervisor."""
     return {
         key: value
@@ -167,8 +165,8 @@ def clear_internal_environment(environment: dict[str, str]) -> dict[str, str]:
 
 
 def replace_restart_environment(
-    environment: dict[str, str],
-    restart_environment: dict[str, str],
+    environment: Dict[str, str],
+    restart_environment: Dict[str, str],
 ) -> None:
     for key in tuple(environment):
         if key.startswith(RESTART_ENV_PREFIX):
@@ -176,7 +174,7 @@ def replace_restart_environment(
     environment.update(restart_environment)
 
 
-def _child_channel() -> tuple[Path, str] | None:
+def _child_channel() -> Optional[Tuple[Path, str]]:
     if not is_supervised_child():
         return None
     root = Path(os.environ[SUPERVISOR_ROOT_ENV])
@@ -184,7 +182,7 @@ def _child_channel() -> tuple[Path, str] | None:
     return root, generation
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
@@ -192,7 +190,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     descriptor = os.open(
         temporary_path,
@@ -205,6 +203,13 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
             file.flush()
             os.fsync(file.fileno())
     except BaseException:
-        temporary_path.unlink(missing_ok=True)
+        _unlink_if_present(temporary_path)
         raise
     os.replace(temporary_path, path)
+
+
+def _unlink_if_present(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
