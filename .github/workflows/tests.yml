@@ -58,9 +58,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Test in official legacy Python container
-        run: >-
-          docker run --rm
-          --volume "$GITHUB_WORKSPACE:/workspace"
-          --workdir /workspace
-          python:${{ matrix.python-version }}
-          bash -c "python -m pip install . && python tests/test_python36.py && py-frp --version"
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            python:${{ matrix.python-version }} \
+            bash -c '
+              set -o pipefail
+              {
+                python -m pip install . &&
+                python tests/test_python36.py &&
+                py-frp --version
+              } 2>&1 | tee /tmp/py-frp-legacy-test.log
+              status=${PIPESTATUS[0]}
+              if [ "$status" -ne 0 ]; then
+                message=$(tail -c 4000 /tmp/py-frp-legacy-test.log | tr "\n" " " | sed "s/%/%25/g")
+                printf "::error title=Legacy Python container failed::%s\n" "$message"
+              fi
+              exit "$status"
+            '
