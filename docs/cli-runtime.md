@@ -144,10 +144,13 @@ entire update stop/start sequence.
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Normal completion; also used after a logged fatal TLS, authentication, or pool-exhaustion response |
-| `1` | Unhandled runtime or elevation failure |
+| `0` | Normal completion |
+| `1` | Fatal TLS, authentication, pool-exhaustion, runtime, or elevation failure |
 | `2` | CLI parsing or configuration error |
 | `130` | Interrupted with Ctrl+C |
+
+Embedded callers of `Client.run()` also receive `1` for fatal client errors.
+Cancellation still propagates as `asyncio.CancelledError`.
 
 Logs go to stderr. Generated pool credentials, TLS fingerprints, and assigned
 pool ports go to stdout so automation can capture structured operational output

@@ -22,13 +22,17 @@ The client requires either a configuration file or both `--server` and
 | `--server-fingerprint VALUE` | interactive | Pin a full fingerprint or a fingerprint pattern containing `...` |
 | `--local HOST:PORT` | `127.0.0.1:22` | TCP target reachable from the client |
 | `--reconnect-delay SECONDS` | `3.0` | Delay after a recoverable control disconnect |
-| `--connect-timeout SECONDS` | `10.0` | Timeout while opening the local target |
+| `--connect-timeout SECONDS` | `10.0` | Timeout opening TCP/TLS connections and reading each handshake response |
 | `--heartbeat-interval SECONDS` | `30.0` | Interval between control-channel pings |
 | `--auto-restart`, `--no-auto-restart` | on | Enable or disable restart after an installed package version change |
 | `--update-check-interval SECONDS` | `5.0` | Seconds between installed package version checks |
 | `--log-level LEVEL` | `INFO` | Logging threshold |
 
-All numeric timeout and interval values must be greater than zero.
+All numeric timeout and interval values must be finite and greater than zero.
+After registration, a missing pong for three heartbeat intervals closes the
+control connection and starts the ordinary reconnect policy. Configure the
+server's idle timeout above the client heartbeat interval when using unusually
+long intervals.
 
 ## Configless client
 

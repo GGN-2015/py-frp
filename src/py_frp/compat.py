@@ -18,6 +18,12 @@ def get_running_loop():
     return getter() if getter is not None else asyncio.get_event_loop()
 
 
+def current_task():
+    """Return the active task on Python 3.6 and newer."""
+    getter = getattr(asyncio, "current_task", None)
+    return getter() if getter is not None else asyncio.Task.current_task()
+
+
 async def to_thread(function, *args, **kwargs):
     """Run a blocking callable in the default executor."""
 

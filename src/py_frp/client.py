@@ -7,7 +7,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .compat import create_task, to_thread
 from .config import ClientConfig
-from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
+from .protocol import (
+    MESSAGE_STREAM_LIMIT, ProtocolError, close_writer, pipe_tunnel_streams,
+    read_message, write_message,
+)
 from .security import (
     SecurityError,
     RESTART_SERVER_FINGERPRINT_ENV,
@@ -52,6 +55,7 @@ class Client:
         self._base_proxies = {proxy.name: proxy for proxy in config.proxies}
         self._proxies = dict(self._base_proxies)
         self._tasks: Set[asyncio.Task] = set()
+        self._last_pong = 0.0
         self._tls_context = create_client_tls_context()
         configured_fingerprint = (
             config.server_fingerprint
@@ -86,7 +90,7 @@ class Client:
             self._fingerprint_ready = asyncio.Event()
         await self._fingerprint_ready.wait()
 
-    async def run(self) -> None:
+    async def run(self) -> int:
         while True:
             try:
                 await self._run_once()
@@ -96,11 +100,11 @@ class Client:
             except SecurityError as exc:
                 LOGGER.error("TLS security error: %s", exc)
                 await self._cancel_tunnel_tasks()
-                return
+                return 1
             except FatalClientError as exc:
                 LOGGER.error("%s", exc)
                 await self._cancel_tunnel_tasks()
-                return
+                return 1
             except ServerRestartingError as exc:
                 LOGGER.info(
                     "server is restarting; reconnecting in %.1fs",
@@ -121,8 +125,11 @@ class Client:
         reader, writer = await self._open_server_connection()
         heartbeat_task: Optional[asyncio.Task] = None
         try:
-            await write_message(writer, {"type": "hello", "version": 2, "client": "py-frp"})
-            hello = await read_message(reader)
+            await write_message(
+                writer, {"type": "hello", "version": 2, "client": "py-frp"},
+                timeout=self.config.connect_timeout,
+            )
+            hello = await read_message(reader, timeout=self.config.connect_timeout)
             if hello is None:
                 raise ProtocolError("server closed during hello")
             _raise_error_response(hello)
@@ -133,8 +140,8 @@ class Client:
             }
             if self.force_connect:
                 register_message["force"] = True
-            await write_message(writer, register_message)
-            registered = await read_message(reader)
+            await write_message(writer, register_message, timeout=self.config.connect_timeout)
+            registered = await read_message(reader, timeout=self.config.connect_timeout)
             if registered is None:
                 raise ProtocolError("server closed during register")
             if registered.get("type") == "force_required":
@@ -145,8 +152,8 @@ class Client:
                 if not self.force_connect and not await self._confirm_force_connection(question):
                     raise FatalClientError("force connection declined; client stopped")
                 register_message["force"] = True
-                await write_message(writer, register_message)
-                registered = await read_message(reader)
+                await write_message(writer, register_message, timeout=self.config.connect_timeout)
+                registered = await read_message(reader, timeout=self.config.connect_timeout)
                 if registered is None:
                     raise ProtocolError("server closed during forced register")
             _raise_error_response(registered)
@@ -156,6 +163,7 @@ class Client:
             LOGGER.info("registered %d service(s)", len(self.config.proxies))
             if self.on_registered is not None:
                 self.on_registered(registered)
+            self._last_pong = time.monotonic()
             heartbeat_task = create_task(self._heartbeat(writer))
 
             while True:
@@ -166,6 +174,7 @@ class Client:
                     task = create_task(self._open_tunnel(message))
                     self._track_tunnel_task(task)
                 elif message.get("type") == "pong":
+                    self._last_pong = time.monotonic()
                     LOGGER.debug("received pong")
                 elif message.get("type") == "error":
                     _raise_error_response(message)
@@ -189,12 +198,13 @@ class Client:
                 self.config.server_host,
                 self.config.server_port,
                 ssl=self._tls_context,
+                limit=MESSAGE_STREAM_LIMIT,
             ),
             timeout=self.config.connect_timeout,
         )
         try:
             await self._verify_server_fingerprint(writer)
-        except Exception:
+        except BaseException:
             await close_writer(writer)
             raise
         return reader, writer
@@ -254,7 +264,13 @@ class Client:
     async def _heartbeat(self, writer: asyncio.StreamWriter) -> None:
         while True:
             await asyncio.sleep(self.config.heartbeat_interval)
-            await write_message(writer, {"type": "ping", "time": time.time()})
+            heartbeat_timeout = 3 * self.config.heartbeat_interval
+            if time.monotonic() - self._last_pong >= heartbeat_timeout:
+                raise ConnectionError("control heartbeat response timed out")
+            await write_message(
+                writer, {"type": "ping", "time": time.time()},
+                timeout=min(self.config.connect_timeout, heartbeat_timeout),
+            )
 
     async def _confirm_force_connection(self, reason: str) -> bool:
         if self.confirm_force is not None:

@@ -9,7 +9,9 @@ from .compat import create_task
 
 LOGGER = logging.getLogger(__name__)
 MAX_MESSAGE_BYTES = 1024 * 1024
+MESSAGE_STREAM_LIMIT = MAX_MESSAGE_BYTES + 1
 BUFFER_SIZE = 64 * 1024
+CLOSE_TIMEOUT = 2.0
 TUNNEL_DATA_FRAME = b"D"
 TUNNEL_EOF_FRAME = b"E"
 
@@ -18,14 +20,21 @@ class ProtocolError(RuntimeError):
     """Raised when a peer sends an invalid protocol message."""
 
 
-async def read_message(reader: asyncio.StreamReader) -> Optional[Dict[str, Any]]:
-    line = await reader.readline()
+async def read_message(
+    reader: asyncio.StreamReader,
+    timeout: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+    except ValueError as exc:
+        raise ProtocolError("message exceeds maximum size") from exc
     if not line:
         return None
-    if len(line) > MAX_MESSAGE_BYTES:
+    payload = line[:-1] if line.endswith(b"\n") else line
+    if len(payload) > MAX_MESSAGE_BYTES:
         raise ProtocolError("message exceeds maximum size")
     try:
-        message = json.loads(line.decode("utf-8"))
+        message = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProtocolError("message is not valid JSON") from exc
     if not isinstance(message, dict):
@@ -36,6 +45,8 @@ async def read_message(reader: asyncio.StreamReader) -> Optional[Dict[str, Any]]
 async def write_message(
     writer: asyncio.StreamWriter,
     message: Mapping[str, Any],
+    *,
+    timeout: float = 10.0,
 ) -> None:
     payload = json.dumps(
         dict(message),
@@ -45,21 +56,27 @@ async def write_message(
     if len(payload) > MAX_MESSAGE_BYTES:
         raise ProtocolError("message exceeds maximum size")
     writer.write(payload + b"\n")
-    await writer.drain()
+    await asyncio.wait_for(writer.drain(), timeout=timeout)
 
 
-async def close_writer(writer: Optional[asyncio.StreamWriter]) -> None:
+async def close_writer(
+    writer: Optional[asyncio.StreamWriter],
+    timeout: float = CLOSE_TIMEOUT,
+) -> None:
     if writer is None:
         return
     is_closing = getattr(writer, "is_closing", None)
-    if is_closing is not None and is_closing():
-        return
-    writer.close()
+    if is_closing is None or not is_closing():
+        writer.close()
     wait_closed = getattr(writer, "wait_closed", None)
     if wait_closed is None:
         return
     try:
-        await wait_closed()
+        await asyncio.wait_for(wait_closed(), timeout=timeout)
+    except asyncio.TimeoutError:
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            transport.abort()
     except (ConnectionError, OSError):
         pass
 
@@ -101,11 +118,11 @@ async def pipe_streams(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    await asyncio.gather(
-        close_writer(left_writer),
-        close_writer(right_writer),
-        return_exceptions=True,
-    )
+        await asyncio.gather(
+            close_writer(left_writer),
+            close_writer(right_writer),
+            return_exceptions=True,
+        )
 
 
 async def pipe_tunnel_streams(
@@ -145,11 +162,11 @@ async def pipe_tunnel_streams(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    await asyncio.gather(
-        close_writer(plain_writer),
-        close_writer(tunnel_writer),
-        return_exceptions=True,
-    )
+        await asyncio.gather(
+            close_writer(plain_writer),
+            close_writer(tunnel_writer),
+            return_exceptions=True,
+        )
 
 
 async def _copy_stream(

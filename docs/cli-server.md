@@ -19,11 +19,20 @@ The server requires either a configuration file or at least one `--port-pool`.
 | `--port-pool SPEC` | none | Public port or inclusive range; repeatable and comma-aware |
 | `--pool-bind-host HOST` | control bind host | Public listener host in pool mode |
 | `--token-length N` | `24` | Length of the generated shared pool token |
+| `--handshake-timeout SECONDS` | `30.0` | Timeout for each initial protocol read in configless mode |
+| `--idle-timeout SECONDS` | `120.0` | Timeout without a control message after registration in configless mode |
 | `--elevate` | off | Request one administrator/root relaunch before binding |
 | `--auto-elevate`, `--no-auto-elevate` | on | Enable or disable automatic elevation for ports below 1024 |
 | `--auto-restart`, `--no-auto-restart` | on | Enable or disable restart after an installed package version change |
 | `--update-check-interval SECONDS` | `5.0` | Seconds between installed package version checks |
 | `--log-level LEVEL` | `INFO` | Logging threshold |
+
+Configuration files accept `handshake_timeout` and `idle_timeout` (or
+`handshakeTimeout` and `idleTimeout` in TOML/JSON). For rathole-style files,
+place them in `[server]`; for INI, use `[common]`. Values must be finite and
+greater than zero. Set the idle timeout above the longest client heartbeat
+interval. A force-confirmation retry uses the idle timeout to allow time for
+the interactive prompt.
 
 ## Configless port-pool mode
 
@@ -63,6 +72,9 @@ occupied by another process is skipped. When every usable port belongs to an
 online client, the server offers preemption only when the incoming client makes
 a forced request. Victim selection and priority rules are documented in the
 [Client CLI](cli-client.md#forced-connection-and-priority).
+
+A registration may request only one port-pool service per client session.
+Multiple pool services in one request are rejected before any port is bound.
 
 For a production-oriented walkthrough covering firewall rules, token handling,
 fingerprint pinning, priorities, and upgrades, use the
