@@ -1,5 +1,6 @@
 import configparser
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ class ServerConfig:
     port_pool: Tuple[int, ...] = ()
     pool_tokens: Tuple[str, ...] = ()
     pool_bind_host: str = "0.0.0.0"
+    handshake_timeout: float = 30.0
+    idle_timeout: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -148,6 +151,8 @@ def _load_frp_or_native_server(data: Mapping[str, Any]) -> ServerConfig:
         allow_dynamic=allow_dynamic,
         source_flavor=source,
         open_timeout=open_timeout,
+        handshake_timeout=_positive_float(_get_any(root, "handshake_timeout", "handshakeTimeout"), 30.0),
+        idle_timeout=_positive_float(_get_any(root, "idle_timeout", "idleTimeout"), 120.0),
     )
 
 
@@ -227,6 +232,8 @@ def _load_rathole_server(data: Mapping[str, Any]) -> ServerConfig:
         allow_dynamic=_bool(_get_any(server, "allow_dynamic", "allowDynamic"), False),
         source_flavor="rathole",
         open_timeout=open_timeout,
+        handshake_timeout=_positive_float(_get_any(server, "handshake_timeout", "handshakeTimeout"), 30.0),
+        idle_timeout=_positive_float(_get_any(server, "idle_timeout", "idleTimeout"), 120.0),
     )
 
 
@@ -296,6 +303,8 @@ def _load_frp_ini_server(path: Path) -> ServerConfig:
         token=token,
         allow_dynamic=allow_dynamic,
         source_flavor="frp-ini",
+        handshake_timeout=_positive_float(common.get("handshake_timeout"), 30.0),
+        idle_timeout=_positive_float(common.get("idle_timeout"), 120.0),
     )
 
 
@@ -526,8 +535,8 @@ def _positive_float(value: Any, default: float) -> float:
         result = float(value)
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"value {value!r} is not a number") from exc
-    if result <= 0:
-        raise ConfigError(f"value {value!r} must be greater than zero")
+    if not math.isfinite(result) or result <= 0:
+        raise ConfigError(f"value {value!r} must be finite and greater than zero")
     return result
 
 

@@ -103,8 +103,9 @@ class ProcessSupervisor:
 
             child_version = launch.status.version
             version_mismatch = target is not None and child_version != target
+            suppressed = False
             if version_mismatch:
-                self._record_failure(
+                suppressed = self._record_failure(
                     target,
                     f"child loaded {child_version} instead of {target}",
                 )
@@ -113,10 +114,12 @@ class ProcessSupervisor:
                 returncode = 1 if launch.returncode is None else launch.returncode
                 if target is None:
                     return returncode
-                if not version_mismatch and self._record_failure(
-                    target,
-                    "child exited during startup validation",
-                ):
+                if not version_mismatch:
+                    suppressed = self._record_failure(
+                        target,
+                        "child exited during startup validation",
+                    )
+                if suppressed:
                     target = self._wait_until_suppression_clears(target)
                 continue
 

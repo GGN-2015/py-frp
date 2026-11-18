@@ -165,8 +165,9 @@ one-supervisor/one-child process shape.
 
 ## Control registration
 
-Control messages are compact UTF-8 JSON objects terminated by a newline. A
-message may not exceed 1 MiB.
+Control messages are compact UTF-8 JSON objects terminated by a newline. The
+JSON payload may not exceed 1 MiB, excluding its terminating newline. Control
+stream readers on both peers use a matching limit.
 
 The normal handshake is:
 
@@ -186,10 +187,17 @@ and uses its own service definition. For a dynamic service, the server requires
 `allow_dynamic`, validates the default token, and binds the requested public
 address. Service names must be unique among connected clients. Registration is
 transactional: if one service fails, listeners created earlier in the same
-request are removed.
+request are removed, including when the registration task is cancelled. A
+single client session may request only one port-pool service; requests with
+multiple pool services are rejected before allocation.
 
 After registration, the client sends `ping` messages at the configured
-heartbeat interval and the server responds with `pong`. Loss of the control
+heartbeat interval and the server responds with `pong`. The client tracks pong
+arrival with a monotonic clock and reconnects after three intervals without a
+pong. The server defaults to a 120-second control idle timeout, configurable
+with `idle_timeout`. Its initial protocol reads use `handshake_timeout`
+(30 seconds by default); client handshake responses use `connect_timeout`.
+Loss of the control
 connection removes all of that client's public listeners and pending tunnels.
 Recoverable failures cause the client to wait `reconnect_delay` and register
 again. Fatal authentication or unforceable resource-exhaustion responses stop
@@ -261,8 +269,13 @@ question. Under the state lock, the server then:
    connection-creation timestamp.
 5. Remove every service and pending tunnel owned by that client, close its
    public listener, and bind the newly freed port for the requester.
-6. Send the victim a non-fatal `preempted` error containing both priorities,
-   then close its control channel.
+6. Release the state lock, send the victim a non-fatal `preempted` error with
+   a one-second write deadline, close its control channel, and cancel its
+   pending and active public relays before waiting for old listeners to close.
+
+Listener shutdown never waits for accepted connections while holding the state
+lock. Victim cleanup and new-listener rollback also run if preemption is
+cancelled.
 
 In compact form, the victim ordering key is: worst eligible numeric priority
 first, then oldest connection first. Priority affects only the forced,
@@ -339,6 +352,15 @@ Cleanup is ownership-based:
   both writers.
 - Server shutdown closes the control listener, fails pending futures, closes
   service listeners, and removes the ephemeral certificate files.
+
+The server tracks accepted control/public writers and connection-handler tasks;
+paired tunnel writers remain tracked until the public relay releases them.
+Shutdown closes writers and cancels handlers before waiting for listeners to
+finish. Cancelling the serving coroutine stops accepting new connections while
+leaving existing control connections available for the restart notice; its
+owner then calls `Server.close()`. Shared writer cleanup waits at most two
+seconds for graceful shutdown before aborting a stalled transport. Relay
+helpers close both writers in their cancellation cleanup as well.
 
 ## Security boundary
 

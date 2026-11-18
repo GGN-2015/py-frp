@@ -10,6 +10,30 @@ from py_frp.pool import TOKEN_ALPHABET, generate_tokens, parse_port_pool, parse_
 
 
 class ConfigTests(unittest.TestCase):
+    def test_server_timeouts_load_from_each_supported_format(self) -> None:
+        configurations = {
+            "frps.toml": "handshakeTimeout = 4\nidleTimeout = 50\n",
+            "rathole.toml": '[server]\nbind_addr = "127.0.0.1:7000"\nhandshake_timeout = 4\nidle_timeout = 50\n',
+            "frps.ini": "[common]\nhandshake_timeout = 4\nidle_timeout = 50\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for name, content in configurations.items():
+                with self.subTest(format=name):
+                    path = Path(directory) / name
+                    path.write_text(content, encoding="utf-8")
+                    config = load_server_config(path)
+                    self.assertEqual(config.handshake_timeout, 4)
+                    self.assertEqual(config.idle_timeout, 50)
+
+    def test_non_finite_timeout_values_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.toml"
+            for value in ("nan", "inf", "-inf", "0", "-1"):
+                with self.subTest(value=value):
+                    path.write_text(f"idle_timeout = {value}\n", encoding="utf-8")
+                    with self.assertRaises(ConfigError):
+                        load_server_config(path)
+
     def test_load_frp_toml_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

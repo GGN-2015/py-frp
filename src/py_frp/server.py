@@ -4,11 +4,14 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .compat import get_running_loop
+from .compat import create_task, current_task, get_running_loop
 from .config import ServerConfig, ServerServiceConfig
-from .protocol import ProtocolError, close_writer, pipe_tunnel_streams, read_message, write_message
+from .protocol import (
+    CLOSE_TIMEOUT, MESSAGE_STREAM_LIMIT, ProtocolError, close_writer,
+    pipe_tunnel_streams, read_message, write_message,
+)
 from .security import ServerTLS, create_server_tls
 
 
@@ -81,6 +84,7 @@ class PendingTunnel:
     client: ClientSession
     future: asyncio.Future
     created_at: float = field(default_factory=time.monotonic)
+    task: Optional[asyncio.Task] = None
 
 
 class Server:
@@ -91,22 +95,35 @@ class Server:
         self._services: Dict[str, RegisteredService] = {}
         self._pending: Dict[str, PendingTunnel] = {}
         self._clients: Dict[str, ClientSession] = {}
-        self._lock = asyncio.Lock()
+        self._state_lock: Optional[asyncio.Lock] = None
         self._server: Optional[asyncio.AbstractServer] = None
         self._tls: Optional[ServerTLS] = None
+        self._writers: Set[asyncio.StreamWriter] = set()
+        self._handlers: Set[asyncio.Task] = set()
+        self._closing = False
+        self._serve_future: Optional[asyncio.Future] = None
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        # Python 3.6 locks bind to the loop at construction time.
+        if self._state_lock is None:
+            self._state_lock = asyncio.Lock()
+        return self._state_lock
 
     async def start(self) -> None:
         if self._server is not None:
             return
+        self._closing = False
         self._tls = create_server_tls(self.config.bind_host)
         try:
             self._server = await asyncio.start_server(
-                self._handle_connection,
+                self._accept_connection,
                 self.config.bind_host,
                 self.config.bind_port,
                 ssl=self._tls.context,
+                limit=MESSAGE_STREAM_LIMIT,
             )
-        except Exception:
+        except BaseException:
             self._tls.close()
             self._tls = None
             raise
@@ -116,39 +133,98 @@ class Server:
     async def serve_forever(self) -> None:
         await self.start()
         assert self._server is not None
-        if not hasattr(self._server, "serve_forever"):
-            await asyncio.Future()
-            return
-        async with self._server:
-            await self._server.serve_forever()
+        listener = self._server
+        self._serve_future = get_running_loop().create_future()
+        try:
+            # Server.serve_forever()/__aexit__ may wait for live connections on
+            # cancellation. Keep those alive until the owner can notify peers
+            # of an update and explicitly call close().
+            await self._serve_future
+        finally:
+            listener.close()
+            self._serve_future = None
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-
-        if self._tls is not None:
-            self._tls.close()
-            self._tls = None
-
+        self._closing = True
+        listener, self._server = self._server, None
+        if listener is not None:
+            listener.close()
+        if self._serve_future is not None:
+            self._serve_future.cancel()
         async with self._lock:
             services = list(self._services.values())
             self._services.clear()
             pending = list(self._pending.values())
             self._pending.clear()
-            clients = list(self._clients.values())
             self._clients.clear()
-
-        for item in pending:
-            if not item.future.done():
-                item.future.set_exception(ConnectionError("server is closing"))
-
+        writers = list(self._writers)
+        for writer in writers:
+            writer.close()
         for service in services:
             service.listener.close()
+        tasks = [task for task in self._handlers if task is not current_task()]
+        for task in tasks:
+            task.cancel()
         await asyncio.gather(
-            *(service.listener.wait_closed() for service in services),
-            *(close_writer(client.writer) for client in clients),
+            *tasks,
+            *(close_writer(writer) for writer in writers),
+            return_exceptions=True,
+        )
+        await self._close_services(services, pending)
+        try:
+            if listener is not None:
+                await asyncio.wait_for(listener.wait_closed(), timeout=CLOSE_TIMEOUT)
+        finally:
+            self._writers.difference_update(writers)
+            if self._tls is not None:
+                self._tls.close()
+                self._tls = None
+
+    def _spawn_handler(self, coroutine) -> None:
+        task = create_task(coroutine)
+        self._handlers.add(task)
+        task.add_done_callback(self._handler_done)
+
+    def _handler_done(self, task: asyncio.Task) -> None:
+        self._handlers.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                LOGGER.error("connection cleanup failed: %r", error)
+
+    def _accept_connection(self, reader, writer) -> None:
+        if self._closing:
+            writer.close()
+            return
+        self._writers.add(writer)
+        self._spawn_handler(self._handle_connection(reader, writer))
+
+    def _accept_public(self, name, reader, writer) -> None:
+        if self._closing:
+            writer.close()
+            return
+        self._writers.add(writer)
+        self._spawn_handler(self._handle_public(name, reader, writer))
+
+    async def _close_services(
+        self,
+        services: List[RegisteredService],
+        pending: List[PendingTunnel],
+    ) -> None:
+        for service in services:
+            service.listener.close()
+        tasks = set()
+        for item in pending:
+            if not item.future.done():
+                item.future.cancel()
+            if item.task is not None and item.task is not current_task() and not item.task.done():
+                tasks.add(item.task)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *(asyncio.wait_for(service.listener.wait_closed(), timeout=CLOSE_TIMEOUT)
+              for service in services),
             return_exceptions=True,
         )
 
@@ -213,19 +289,21 @@ class Server:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        paired = False
         try:
-            first = await read_message(reader)
+            first = await read_message(reader, timeout=self.config.handshake_timeout)
             if first is None:
                 await close_writer(writer)
                 return
             message_type = first.get("type")
             if message_type == "tunnel":
                 await self._handle_tunnel(first, reader, writer)
+                paired = True
                 return
             await self._handle_control(first, reader, writer)
         except asyncio.CancelledError:
             raise
-        except (ProtocolError, OSError, ConnectionError) as exc:
+        except (asyncio.TimeoutError, ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.debug("connection rejected: %s", exc)
             await _best_effort_error(writer, str(exc), fatal=isinstance(exc, AuthenticationError))
             await close_writer(writer)
@@ -233,6 +311,10 @@ class Server:
             LOGGER.exception("connection handler crashed")
             await _best_effort_error(writer, str(exc))
             await close_writer(writer)
+        finally:
+            if not paired:
+                await close_writer(writer)
+                self._writers.discard(writer)
 
     async def _handle_control(
         self,
@@ -247,7 +329,7 @@ class Server:
             current = first
             if current.get("type") == "hello":
                 await client.send({"type": "hello", "version": 2, "server": "py-frp"})
-                current = await read_message(reader) or {}
+                current = await read_message(reader, timeout=self.config.handshake_timeout) or {}
             if current.get("type") != "register":
                 raise ProtocolError("control connection must register services")
 
@@ -265,7 +347,7 @@ class Server:
                         "error": str(exc),
                     }
                 )
-                retry = await read_message(reader)
+                retry = await read_message(reader, timeout=self.config.idle_timeout)
                 if retry is None:
                     return
                 current = retry
@@ -297,7 +379,7 @@ class Server:
             LOGGER.info("client %s registered %d service(s)", client.id, len(registered))
 
             while True:
-                message = await read_message(reader)
+                message = await read_message(reader, timeout=self.config.idle_timeout)
                 if message is None:
                     break
                 message_type = message.get("type")
@@ -309,7 +391,7 @@ class Server:
                     LOGGER.debug("ignored control message from %s: %s", client.id, message)
         except asyncio.CancelledError:
             raise
-        except (ProtocolError, OSError, ConnectionError) as exc:
+        except (asyncio.TimeoutError, ProtocolError, OSError, ConnectionError) as exc:
             LOGGER.warning("client %s disconnected: %s", client.id, exc)
             await _best_effort_error(
                 writer,
@@ -335,6 +417,13 @@ class Server:
     ) -> List[RegisteredService]:
         if not isinstance(raw_services, list) or not raw_services:
             raise ProtocolError("register message must include services")
+        if sum(self._is_pool_registration(raw) for raw in raw_services) > 1:
+            raise ProtocolError("only one port-pool service may be registered per client")
+        async with self._lock:
+            if self._closing:
+                raise ProtocolError("server is closing")
+            previous_names = {name for name, service in self._services.items()
+                              if service.client is client}
 
         registered: List[RegisteredService] = []
         try:
@@ -353,8 +442,11 @@ class Server:
                     registered_service.name,
                     _server_addresses(registered_service.listener),
                 )
-        except Exception:
-            for item in registered:
+        except BaseException:
+            async with self._lock:
+                created = [service for name, service in self._services.items()
+                           if service.client is client and name not in previous_names]
+            for item in created:
                 await self._drop_registered_service(item)
             raise
         return registered
@@ -366,7 +458,7 @@ class Server:
     ) -> RegisteredService:
         service = self._service_from_registration(raw)
         listener = await asyncio.start_server(
-            lambda reader, writer, name=service.name: self._handle_public(name, reader, writer),
+            lambda reader, writer, name=service.name: self._accept_public(name, reader, writer),
             service.bind_host,
             service.bind_port,
         )
@@ -379,12 +471,16 @@ class Server:
             listener=listener,
             configured=service.name in self._configured,
         )
-        async with self._lock:
-            if service.name in self._services:
-                listener.close()
-                await listener.wait_closed()
-                raise ProtocolError(f"service {service.name!r} is already registered")
-            self._services[service.name] = registered_service
+        try:
+            async with self._lock:
+                if self._closing:
+                    raise ProtocolError("server is closing")
+                if service.name in self._services:
+                    raise ProtocolError(f"service {service.name!r} is already registered")
+                self._services[service.name] = registered_service
+        except BaseException:
+            await self._close_services([registered_service], [])
+            raise
         return registered_service
 
     async def _register_pool_service(
@@ -408,86 +504,99 @@ class Server:
         registered_service: Optional[RegisteredService] = None
         last_error: Optional[OSError] = None
 
-        async with self._lock:
-            registered_service, last_error = await self._bind_pool_service_locked(
-                client,
-                service_name,
-                token,
-                priority,
-            )
-            if registered_service is not None:
-                return registered_service
+        try:
+            async with self._lock:
+                registered_service, last_error = await self._bind_pool_service_locked(
+                    client,
+                    service_name,
+                    token,
+                    priority,
+                )
+                if registered_service is not None:
+                    return registered_service
 
-            pool_services = [
-                service
-                for service in self._services.values()
-                if service.pool_token is not None and service.client is not client
-            ]
-            if not pool_services:
-                raise _resource_exhausted(last_error)
-            if not force:
-                raise ForceRequiredError(
-                    "resource insufficient: the port pool is full; force connection can "
-                    "disconnect an eligible equal-or-lower-priority pool client"
+                pool_services = [
+                    service
+                    for service in self._services.values()
+                    if service.pool_token is not None and service.client is not client
+                ]
+                if not pool_services:
+                    raise _resource_exhausted(last_error)
+                if not force:
+                    raise ForceRequiredError(
+                        "resource insufficient: the port pool is full; force connection can "
+                        "disconnect an eligible equal-or-lower-priority pool client"
+                    )
+
+                max_priority = max(service.priority for service in pool_services)
+                eligible_services = [
+                    service for service in pool_services if service.priority >= priority
+                ]
+                if not eligible_services:
+                    raise PriorityPreemptionError(priority, max_priority)
+                victim_priority = max(service.priority for service in eligible_services)
+                victim_service = min(
+                    (
+                        service
+                        for service in eligible_services
+                        if service.priority == victim_priority
+                    ),
+                    key=lambda service: service.client.created_at,
+                )
+                victim = victim_service.client
+                victim_services = [
+                    service for service in self._services.values() if service.client is victim
+                ]
+                for service in victim_services:
+                    self._services.pop(service.name, None)
+                    service.listener.close()
+                victim_pending = [
+                    item for item in self._pending.values() if item.client is victim
+                ]
+                for item in victim_pending:
+                    self._pending.pop(item.id, None)
+                registered_service, last_error = await self._bind_pool_service_locked(
+                    client,
+                    service_name,
+                    token,
+                    priority,
+                )
+        finally:
+            if victim is not None:
+                await self._finish_preemption(
+                    victim, victim_services, victim_pending, client, priority, victim_priority,
                 )
 
-            max_priority = max(service.priority for service in pool_services)
-            eligible_services = [
-                service for service in pool_services if service.priority >= priority
-            ]
-            if not eligible_services:
-                raise PriorityPreemptionError(priority, max_priority)
-            victim_priority = max(service.priority for service in eligible_services)
-            victim_service = min(
-                (
-                    service
-                    for service in eligible_services
-                    if service.priority == victim_priority
-                ),
-                key=lambda service: service.client.created_at,
-            )
-            victim = victim_service.client
-            victim_services = [
-                service for service in self._services.values() if service.client is victim
-            ]
-            for service in victim_services:
-                self._services.pop(service.name, None)
-                service.listener.close()
-            victim_pending = [
-                item for item in self._pending.values() if item.client is victim
-            ]
-            for item in victim_pending:
-                self._pending.pop(item.id, None)
-            await asyncio.gather(
-                *(service.listener.wait_closed() for service in victim_services),
-                return_exceptions=True,
-            )
+        if registered_service is None:
+            raise _resource_exhausted(last_error)
+        return registered_service
 
-            registered_service, last_error = await self._bind_pool_service_locked(
-                client,
-                service_name,
-                token,
-                priority,
-            )
-
-        for item in victim_pending:
-            if not item.future.done():
-                item.future.set_exception(ConnectionError("client was preempted"))
-        assert victim is not None
+    async def _finish_preemption(
+        self,
+        victim: ClientSession,
+        victim_services: List[RegisteredService],
+        victim_pending: List[PendingTunnel],
+        client: ClientSession,
+        priority: int,
+        victim_priority: int,
+    ) -> None:
         try:
-            await victim.send(
-                {
+            await asyncio.wait_for(
+                victim.send({
                     "type": "error",
                     "error": "connection preempted by a forced pool connection",
                     "code": "preempted",
                     "fatal": False,
                     "priority": victim_priority,
                     "preempted_by_priority": priority,
-                }
+                }),
+                timeout=1.0,
             )
-        except (ConnectionError, OSError, ProtocolError):
+        except (asyncio.TimeoutError, ConnectionError, OSError, ProtocolError):
             pass
-        await close_writer(victim.writer)
+        finally:
+            await close_writer(victim.writer)
+            await self._close_services(victim_services, victim_pending)
         LOGGER.warning(
             "client %s at priority %d was preempted by forced client %s at priority %d",
             victim.id,
@@ -496,10 +605,6 @@ class Server:
             priority,
         )
 
-        if registered_service is None:
-            raise _resource_exhausted(last_error)
-        return registered_service
-
     async def _bind_pool_service_locked(
         self,
         client: ClientSession,
@@ -507,6 +612,10 @@ class Server:
         token: str,
         priority: int,
     ) -> Tuple[Optional[RegisteredService], Optional[OSError]]:
+        if self._closing:
+            raise ProtocolError("server is closing")
+        if service_name in self._services:
+            raise ProtocolError("client already has a port-pool service")
         used_ports = {
             service.bind_port
             for service in self._services.values()
@@ -518,7 +627,7 @@ class Server:
                 continue
             try:
                 listener = await asyncio.start_server(
-                    lambda reader, writer, name=service_name: self._handle_public(
+                    lambda reader, writer, name=service_name: self._accept_public(
                         name,
                         reader,
                         writer,
@@ -557,9 +666,13 @@ class Server:
 
     async def _drop_registered_service(self, service: RegisteredService) -> None:
         async with self._lock:
-            self._services.pop(service.name, None)
-        service.listener.close()
-        await service.listener.wait_closed()
+            if self._services.get(service.name) is service:
+                self._services.pop(service.name)
+            pending = [item for item in self._pending.values()
+                       if item.service_name == service.name and item.client is service.client]
+            for item in pending:
+                self._pending.pop(item.id, None)
+        await self._close_services([service], pending)
 
     def _service_from_registration(self, raw: Any) -> ServerServiceConfig:
         if not isinstance(raw, dict):
@@ -599,16 +712,7 @@ class Server:
             for item in pending:
                 self._pending.pop(item.id, None)
 
-        for item in pending:
-            if not item.future.done():
-                item.future.set_exception(ConnectionError("client disconnected"))
-
-        for service in services:
-            service.listener.close()
-        await asyncio.gather(
-            *(service.listener.wait_closed() for service in services),
-            return_exceptions=True,
-        )
+        await self._close_services(services, pending)
         if services:
             LOGGER.info("client %s unregistered %d service(s)", client.id, len(services))
 
@@ -618,24 +722,27 @@ class Server:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        async with self._lock:
-            service = self._services.get(service_name)
-        if service is None:
-            await close_writer(writer)
-            return
-
         tunnel_id = secrets.token_urlsafe(24)
         loop = get_running_loop()
         future = loop.create_future()
-        pending = PendingTunnel(
-            id=tunnel_id,
-            service_name=service_name,
-            token=service.token,
-            client=service.client,
-            future=future,
-        )
         async with self._lock:
-            self._pending[tunnel_id] = pending
+            service = self._services.get(service_name)
+            if service is not None and not self._closing:
+                pending = PendingTunnel(
+                    id=tunnel_id,
+                    service_name=service_name,
+                    token=service.token,
+                    client=service.client,
+                    future=future,
+                    task=current_task(),
+                )
+                self._pending[tunnel_id] = pending
+            else:
+                pending = None
+        if pending is None:
+            await close_writer(writer)
+            self._writers.discard(writer)
+            return
 
         tunnel_writer: Optional[asyncio.StreamWriter] = None
         try:
@@ -663,8 +770,14 @@ class Server:
                     self._pending.pop(tunnel_id, None)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled() and future.exception() is None:
+                # Pairing may have completed immediately before cancellation.
+                _, tunnel_writer = future.result()
             await close_writer(writer)
             await close_writer(tunnel_writer)
+            self._writers.discard(writer)
+            if tunnel_writer is not None:
+                self._writers.discard(tunnel_writer)
 
     async def _handle_tunnel(
         self,

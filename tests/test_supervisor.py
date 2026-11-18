@@ -216,6 +216,24 @@ class ProcessSupervisorTests(unittest.TestCase):
         self.assertEqual(result.restart_target, "0.7.0")
         channel.request_restart.assert_called_once_with("generation", "0.7.0")
 
+    def test_wrong_version_early_exits_obey_restart_circuit_breaker(self) -> None:
+        channel = mock.Mock()
+        channel.restart_state.return_value = RestartState("0.7.0", {})
+        old = ChildStatus("0.6.0", 100)
+        recovered = ChildStatus("0.8.0", 101)
+        launches = [LaunchResult(old, None)]
+        launches.extend(LaunchResult(old, 1) for _ in range(RESTART_FAILURE_LIMIT))
+        launches.append(LaunchResult(recovered, None))
+        with mock.patch.object(self.supervisor, "_launch_child", side_effect=launches) as launch, \
+             mock.patch.object(self.supervisor, "_monitor_child", side_effect=(
+                 MonitorResult(restart_target="0.7.0"), MonitorResult(returncode=0),
+             )), \
+             mock.patch.object(self.supervisor, "_wait_until_suppression_clears", return_value="0.8.0") as wait:
+            result = self.supervisor._run_children(channel)
+        self.assertEqual(result, 0)
+        self.assertEqual(launch.call_count, RESTART_FAILURE_LIMIT + 2)
+        wait.assert_called_once_with("0.7.0")
+
     def test_ctrl_c_waits_for_child_and_returns_130(self) -> None:
         child = mock.Mock()
         child.wait.return_value = 130

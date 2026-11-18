@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 import sys
 from typing import Dict, Optional, Sequence, Tuple
@@ -97,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     server.add_argument("--pool-bind-host", help="public port bind host for configless mode")
     server.add_argument("--token-length", type=int, default=24, help="generated token length")
+    server.add_argument("--handshake-timeout", type=float, default=30.0, help="seconds allowed for each control handshake read")
+    server.add_argument("--idle-timeout", type=float, default=120.0, help="seconds without a control message before disconnecting")
     server.add_argument(
         "--elevate",
         action="store_true",
@@ -273,6 +276,8 @@ def _load_server_command_config(args: argparse.Namespace) -> ServerConfig:
         port_pool=ports,
         pool_tokens=tokens,
         pool_bind_host=args.pool_bind_host or args.bind_host,
+        handshake_timeout=_positive_float(args.handshake_timeout, "handshake timeout"),
+        idle_timeout=_positive_float(args.idle_timeout, "idle timeout"),
     )
 
 
@@ -340,8 +345,8 @@ def _port(value: str) -> int:
 
 
 def _positive_float(value: float, label: str) -> float:
-    if value <= 0:
-        raise ConfigError(f"{label} must be greater than zero")
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{label} must be finite and greater than zero")
     return value
 
 
